@@ -1,0 +1,57 @@
+:root {
+  --wp-bg: #03050a;
+  --wp-bg-soft: #0a0f1e;
+  --wp-accent: #3b82f6;
+  --wp-accent-glow: rgba(59, 130, 146, 0.4);
+  --wp-success: #10b981;
+  --wp-danger: #ef4444;
+  --wp-warning: #f59e0b;
+  --wp-text: #f1f5f9;
+  --wp-text-mute: #94a3b8;
+  
+  --glass-bg: rgba(15, 23, 42, 0.65);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-blur: blur(12px);
+  
+  --card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+:root {
+  --color-background: var(--wp-bg);
+  --color-text: var(--wp-text);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  font-weight: normal;
+}
+
+ul {
+  list-style: none;
+}
+
+body {
+  min-height: 100vh;
+  color: var(--color-text);
+  background: var(--color-background);
+  line-height: 1.6;
+  font-family:
+    Inter,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    Oxygen,
+    Ubuntu,
+    Cantarell,
+    'Fira Sans',
+    'Droid Sans',
+    'Helvetica Neue',
+    sans-serif;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
