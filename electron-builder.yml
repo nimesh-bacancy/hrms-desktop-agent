@@ -13,6 +13,8 @@ asarUnpack:
   - resources/**
 win:
   executableName: workpulse-agent-electron
+  # certificateFile: "path/to/your/certificate.pfx" # TODO: Add your .pfx file path
+  # certificatePassword: "YOUR_PASSWORD"          # TODO: Add your password or use environment variable CSC_PASSWORD
 nsis:
   artifactName: ${name}-${version}-setup.${ext}
   shortcutName: ${productName}
@@ -20,6 +22,7 @@ nsis:
   createDesktopShortcut: always
 mac:
   entitlementsInherit: build/entitlements.mac.plist
+  # identity: "Apple Development: Your Name (ID)"  # TODO: Add your Apple Developer ID
   extendInfo:
     - NSCameraUsageDescription: Application requests access to the device's camera.
     - NSMicrophoneUsageDescription: Application requests access to the device's microphone.

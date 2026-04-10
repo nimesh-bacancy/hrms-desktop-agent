@@ -10,9 +10,13 @@ An Electron application with React and TypeScript
 
 ### Install
 
-```bash
-$ pnpm install
-```
+1.  **Windows Build Prerequisites**: To build native modules (like window tracking), you must have the following installed on your machine:
+    - **Visual Studio Build Tools**: Select "Desktop development with C++" workload.
+    - **Python 3.x**: Ensure it is added to your PATH.
+2.  **Install Dependencies**:
+    ```bash
+    $ pnpm install
+    ```
 
 ### Development
 
@@ -49,4 +53,7 @@ To publish a new version and enable auto-updates for users:
 5.  **Verify**: Existing agents will automatically detect the new version within minutes!
 
 > [!TIP]
-> **Code Signing**: For production, insure you have configured your Code Signing certificates in `electron-builder.yml` to prevent "Unknown Publisher" warnings for your users.
+> **Code Signing (Mandatory for Production)**:
+> To avoid "Unknown Publisher" warnings:
+> - **Windows**: Set `CSC_LINK` (path to .pfx) and `CSC_KEY_PASSWORD` env variables.
+> - **macOS**: Build on a Mac with a valid "Developer ID Application" certificate in your Keychain.
