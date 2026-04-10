@@ -12,6 +12,9 @@ export class DesktopEngine {
   private isTracking: boolean = false
   private attendanceId: number | null = null
   private isLocked: boolean = false
+  private trackingStartTime: string | null = null
+  private heartbeatInterval: NodeJS.Timeout | null = null
+  private pulseInterval: NodeJS.Timeout | null = null
   
   // Tracking State
   private pulsesSinceScreenshot: number = 0
@@ -34,10 +37,52 @@ export class DesktopEngine {
   }
 
   public setAuth(apiUrl: string, token: string) {
+    const hadToken = !!this.token
+    const isLoggingOut = hadToken && !token
+    const isLoggingIn = !hadToken && !!token
+
     this.apiUrl = apiUrl
     this.token = token
-    // Successful login — attempt to clear any backlogged data
+
+    if (isLoggingOut) {
+      // Pause all intervals but keep isTracking + trackingStartTime intact
+      if (this.pulseInterval) { clearInterval(this.pulseInterval); this.pulseInterval = null }
+      if (this.heartbeatInterval) { clearInterval(this.heartbeatInterval); this.heartbeatInterval = null }
+      this.log('Logged out — tracking state preserved, intervals paused.')
+      return
+    }
+
+    if (isLoggingIn) {
+      // Resume heartbeat immediately
+      this.startHeartbeat()
+      // If we were tracking before logout, resume the pulse loop
+      if (this.isTracking) {
+        this.log('Re-authenticated — resuming tracked session from preserved state.')
+        this.pulseInterval = setInterval(() => this.runPulse(), 60000)
+        this.runPulse('heartbeat') // immediate pulse to re-register with server
+      }
+      this.syncOfflineQueue()
+      return
+    }
+
+    // First-time login (no prior token)
+    if (this.token && !this.heartbeatInterval) {
+      this.startHeartbeat()
+    }
     this.syncOfflineQueue()
+  }
+
+  private startHeartbeat() {
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval)
+    // Send initial status heartbeat
+    this.runPulse('heartbeat')
+    // Repeat every 5 minutes to maintain "Online" status on dashboard
+    this.heartbeatInterval = setInterval(() => {
+      // Only heartbeat if NOT already tracking (tracking sends more frequent pulses)
+      if (!this.isTracking) {
+        this.runPulse('heartbeat')
+      }
+    }, 5 * 60 * 1000)
   }
 
   public startTracking() {
@@ -47,6 +92,7 @@ export class DesktopEngine {
     // Automatically Clock In and fetch Attendance first
     this.triggerClockIn().then((success) => {
       if (success) {
+        this.trackingStartTime = new Date().toISOString()
         // Fire an immediate pulse to register the 'agent_start'
         this.runPulse('agent_start')
       }
@@ -61,6 +107,7 @@ export class DesktopEngine {
   public stopTracking() {
     if (!this.isTracking) return
     this.isTracking = false
+    this.trackingStartTime = null
     if (this.pulseInterval) {
       clearInterval(this.pulseInterval)
       this.pulseInterval = null
@@ -77,6 +124,7 @@ export class DesktopEngine {
   public forceStop() {
     if (!this.isTracking) return
     this.isTracking = false
+    this.trackingStartTime = null
     if (this.pulseInterval) {
       clearInterval(this.pulseInterval)
       this.pulseInterval = null
@@ -110,6 +158,15 @@ export class DesktopEngine {
     } catch (e) {
       this.log(`Failed to Clock In via agent: ${e.message}`)
       return false
+    }
+  }
+
+  public getStatus() {
+    return {
+      isTracking: this.isTracking,
+      startTime: this.trackingStartTime,
+      apiUrl: this.apiUrl,
+      token: !!this.token // Just return if we have a token
     }
   }
 
@@ -159,9 +216,15 @@ export class DesktopEngine {
 
   private async runPulse(eventType: string | null = null) {
     try {
+      // If token is missing (logged out), skip silently — don't forceStop
+      if (!this.token) {
+        this.log('Pulse skipped: no auth token (user logged out).')
+        return
+      }
+
       // Very strict sync: Verify attendance status before every pulse
       // If we discover we are no longer clocked in on HRMS, abort tracking
-      if (eventType !== 'agent_start') {
+      if (eventType !== 'agent_start' && eventType !== 'heartbeat') {
         const ok = await this.fetchAttendanceId()
         if (!ok) {
           this.forceStop()
@@ -169,10 +232,10 @@ export class DesktopEngine {
           BrowserWindow.getAllWindows().forEach(w => w.webContents.send('force-stop'))
           return
         }
-      } else if (!this.attendanceId) {
+      } else if (!this.attendanceId && eventType === 'agent_start') {
         // Fallback for startup
         const ok = await this.triggerClockIn()
-        if (!ok) return 
+        if (!ok) return
       }
 
       // Real idle detection via Electron's built-in powerMonitor
@@ -317,5 +380,10 @@ export class DesktopEngine {
         log.error('Could not write offline queue', err)
       }
     }
+  }
+
+  public destroy() {
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval)
+    if (this.pulseInterval) clearInterval(this.pulseInterval)
   }
 }

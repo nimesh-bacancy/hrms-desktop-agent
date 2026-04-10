@@ -1,5 +1,6 @@
-import { app, shell, BrowserWindow, ipcMain, powerMonitor, Notification } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, powerMonitor, Notification, Tray, Menu } from 'electron'
 import { join } from 'path'
+import { promises as fs } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import log from 'electron-log'
 import icon from '../../resources/icon.png?asset'
@@ -8,10 +9,16 @@ import { initializeUpdater } from './updater'
 
 // Initialize Tracking Engine early
 const engine = new DesktopEngine()
+let tray: Tray | null = null
+let mainWindow: BrowserWindow | null = null
+let isQuitting = false
+
+// Detect if we were launched by an autostart mechanism
+const isAutoLaunched = process.argv.includes('--autostart')
 
 function createWindow(): void {
   // Create the browser window.
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 900,
     height: 670,
     show: false,
@@ -24,7 +31,21 @@ function createWindow(): void {
   })
 
   mainWindow.on('ready-to-show', () => {
-    mainWindow.show()
+    // If launched via autostart, stay hidden in tray — don't pop up on every boot
+    if (!isAutoLaunched) {
+      if (mainWindow) mainWindow.show()
+    } else {
+      log.info('Auto-launched: starting silently in tray.')
+    }
+  })
+
+  // Prevent window from being destroyed — hide instead
+  mainWindow.on('close', (event) => {
+    if (!isQuitting) {
+      event.preventDefault()
+      if (mainWindow) mainWindow.hide()
+    }
+    return false
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -41,10 +62,25 @@ function createWindow(): void {
   }
 }
 
-// This method will be called when Electron has finished
-// initialization and is ready to create browser windows.
-// Some APIs can only be used after this event occurs.
+// Initialization
 app.whenReady().then(() => {
+  // Create Tray Icon
+  tray = new Tray(icon)
+  const contextMenu = Menu.buildFromTemplate([
+    { label: 'Open WorkPulse', click: () => mainWindow?.show() },
+    { type: 'separator' },
+    { label: 'Quit WorkPulse', click: () => {
+        isQuitting = true
+        app.quit()
+      } 
+    }
+  ])
+  tray.setToolTip('WorkPulse Desktop Agent')
+  tray.setContextMenu(contextMenu)
+  tray.on('click', () => {
+    mainWindow?.show()
+  })
+
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.electron')
 
@@ -61,7 +97,9 @@ app.whenReady().then(() => {
   })
 
   ipcMain.on('logout', () => {
-    engine.stopTracking()
+    // Option B: Don't stop tracking — just disconnect locally.
+    // The attendance session keeps running on the server and will
+    // resume correctly when the user logs back in.
     engine.setAuth('', '')
   })
 
@@ -76,6 +114,18 @@ app.whenReady().then(() => {
   // Provide realtime idle time to the frontend dashboard 
   ipcMain.handle('get-idle-time', () => {
     return powerMonitor.getSystemIdleTime()
+  })
+
+  // Provide engine status and start time to the renderer
+  ipcMain.handle('get-engine-status', () => {
+    return engine.getStatus()
+  })
+
+  // Explicit quit from UI
+  ipcMain.on('app-quit', () => {
+    log.info('Quit requested via IPC.')
+    isQuitting = true
+    app.quit()
   })
 
   // Force the window to pop up and focus if the user becomes idle
@@ -128,17 +178,72 @@ app.whenReady().then(() => {
     }
   })
 
-  // Handle 'Launch at Startup' toggle
-  ipcMain.on('set-launch-at-startup', (_, openAtLogin: boolean) => {
-    app.setLoginItemSettings({
-      openAtLogin,
-      path: app.getPath('exe')
-    })
+  // ── Cross-platform Autostart ──────────────────────────────────────────────
+  // Linux: Write/delete XDG .desktop file in ~/.config/autostart/
+  // Windows/Mac: Use Electron's native login item settings
+  const getLinuxAutostartPath = () => {
+    const configDir = join(app.getPath('home'), '.config', 'autostart')
+    return join(configDir, 'workpulse-agent.desktop')
+  }
+
+  const getLinuxDesktopContent = () => {
+    const execPath = process.execPath
+    return [
+      '[Desktop Entry]',
+      'Type=Application',
+      'Name=WorkPulse Agent',
+      `Exec="${execPath}" --autostart`,
+      'Icon=workpulse-agent',
+      'Comment=WorkPulse Desktop Tracking Agent',
+      'Categories=Utility;',
+      'Terminal=false',
+      'Hidden=false',
+      'X-GNOME-Autostart-enabled=true',
+    ].join('\n') + '\n'
+  }
+
+  const getLinuxAutostartStatus = async (): Promise<boolean> => {
+    try {
+      await fs.access(getLinuxAutostartPath())
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  ipcMain.on('set-launch-at-startup', async (_, openAtLogin: boolean) => {
+    if (process.platform === 'linux') {
+      try {
+        const autostartPath = getLinuxAutostartPath()
+        const configDir = join(app.getPath('home'), '.config', 'autostart')
+        if (openAtLogin) {
+          await fs.mkdir(configDir, { recursive: true })
+          await fs.writeFile(autostartPath, getLinuxDesktopContent(), 'utf8')
+          log.info(`Autostart enabled: wrote ${autostartPath}`)
+        } else {
+          await fs.unlink(autostartPath).catch(() => {}) // ignore if not exists
+          log.info(`Autostart disabled: removed ${autostartPath}`)
+        }
+      } catch (e) {
+        log.error('Failed to set Linux autostart:', e)
+      }
+    } else {
+      app.setLoginItemSettings({
+        openAtLogin,
+        openAsHidden: true, // Start silently in tray on Windows/Mac
+        path: app.getPath('exe')
+      })
+    }
   })
 
-  ipcMain.handle('get-launch-at-startup', () => {
-    return app.getLoginItemSettings().openAtLogin
+  ipcMain.handle('get-launch-at-startup', async () => {
+    if (process.platform === 'linux') {
+      return await getLinuxAutostartStatus()
+    }
+    const settings = app.getLoginItemSettings()
+    return settings.openAtLogin
   })
+  // ──────────────────────────────────────────────────────────────────────────
 
   ipcMain.on('trigger-sync', () => {
     log.info('Manual sync triggered.')
@@ -176,13 +281,9 @@ app.whenReady().then(() => {
   })
 })
 
-// Quit when all windows are closed, except on macOS. There, it's common
-// for applications and their menu bar to stay active until the user quits
-// explicitly with Cmd + Q.
+// Keep the app running even when windows are closed
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
+  // We handle background operation via Tray, so we do nothing here
 })
 
 // Handle Second Instance

@@ -100,8 +100,27 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
         ])
         setUser(usersResp.data)
         setDayStats(statusResp.data)
-        if (statusResp.data.is_agent_active) {
+        
+        // Sync with background engine status
+        // @ts-ignore
+        const engineStatus = await window.electron.ipcRenderer.invoke('get-engine-status')
+
+        if (engineStatus && engineStatus.isTracking) {
+          // Case 1: Engine is already running in background (window was just hidden)
+          // Resume timer from engine's stored start time
           setIsActive(true)
+          if (engineStatus.startTime) {
+            const start = new Date(engineStatus.startTime).getTime()
+            const now = new Date().getTime()
+            setSessionSeconds(Math.floor((now - start) / 1000))
+          }
+        } else if (statusResp.data.is_clocked_in && statusResp.data.last_clock_in) {
+          // Case 2: Engine not running (e.g. after logout/login) but backend says
+          // user is still clocked in. Option B: auto-resume session from clock-in time.
+          setIsActive(true)
+          const start = new Date(statusResp.data.last_clock_in).getTime()
+          const now = new Date().getTime()
+          setSessionSeconds(Math.floor((now - start) / 1000))
         }
       } catch (e) {
         console.error('Failed to fetch user data', e)
@@ -152,8 +171,8 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
           // Fetch exact OS idle seconds directly via IPC
           const systemIdle: number = await window.electron.ipcRenderer.invoke('get-idle-time')
           
-          const IDLE_PROMPT_THRESHOLD = 300 // 5 minutes
-          const AUTO_STOP_THRESHOLD = 420 // 7 minutes
+          const IDLE_PROMPT_THRESHOLD = 180 // 3 minutes
+          const AUTO_STOP_THRESHOLD = 300 // 5 minutes
           
           if (systemIdle >= AUTO_STOP_THRESHOLD) {
              setIsActive(false)
@@ -198,10 +217,15 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
       try {
         const resp = await axios.get(`${apiUrl}/attendance/status`, { headers: authHeaders })
         setDayStats(resp.data)
+        
+        // Final sanity check: if backend says we are clocked out, stop tracking locally
+        if (!resp.data.is_clocked_in) {
+           setIsActive(false)
+        }
       } catch (_) {}
     }, 60000)
     return () => clearInterval(refresh)
-  }, [isActive])
+  }, [isActive, apiUrl, authHeaders])
 
   const totalDaySeconds = (dayStats?.today_total_hours || 0) * 3600
   const workGoalSeconds = 8 * 3600
@@ -324,6 +348,11 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
                <span style={{ fontSize: '0.7rem', opacity: 0.8 }}>({timezone})</span>
                <span style={{ opacity: 0.3 }}>•</span>
                <span>{currentTime.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+               <span style={{ opacity: 0.3 }}>•</span>
+               <span style={{ fontSize: '0.7rem', color: 'var(--wp-success)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: 'currentColor' }} />
+                  Connected
+               </span>
             </p>
           </motion.div>
 
