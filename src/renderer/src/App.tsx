@@ -543,6 +543,17 @@ const App = () => {
   const [authToken, setAuthToken] = useState<string | null>(() => localStorage.getItem('wp_token'))
   const [apiUrl, setApiUrl] = useState<string>(() => localStorage.getItem('wp_api_url') || '')
 
+  // CRITICAL: Re-initialize the main process engine with stored credentials on every startup.
+  // The renderer reads the token from localStorage for its own state, but the main process
+  // engine is a separate Node.js process that loses its in-memory auth on every app quit.
+  // Without this, engine.startTracking() silently returns because engine.token is empty.
+  useEffect(() => {
+    if (authToken && apiUrl) {
+      console.log('[App] Restoring engine auth from localStorage on startup.')
+      window.electron.ipcRenderer.send('save-auth', { url: apiUrl, token: authToken })
+    }
+  }, []) // Run once on mount only
+
   const handleLoginSuccess = (url: string, token: string) => {
     window.electron.ipcRenderer.send('save-auth', { url, token })
     localStorage.setItem('wp_api_url', url)
@@ -567,3 +578,4 @@ const App = () => {
 }
 
 export default App
+

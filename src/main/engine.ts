@@ -222,9 +222,17 @@ export class DesktopEngine {
         return
       }
 
-      // Very strict sync: Verify attendance status before every pulse
-      // If we discover we are no longer clocked in on HRMS, abort tracking
-      if (eventType !== 'agent_start' && eventType !== 'heartbeat') {
+      // Determine how to handle attendance ID based on event type
+      if (eventType === 'heartbeat') {
+        // For heartbeat: try to get attendance ID silently.
+        // If not clocked in yet, just skip — don't forceStop.
+        await this.fetchAttendanceId()
+        if (!this.attendanceId) {
+          this.log('Heartbeat skipped: user not yet clocked in.')
+          return
+        }
+      } else if (eventType !== 'agent_start') {
+        // For regular pulses: strict check — forceStop if not clocked in on server
         const ok = await this.fetchAttendanceId()
         if (!ok) {
           this.forceStop()
@@ -238,32 +246,38 @@ export class DesktopEngine {
         if (!ok) return
       }
 
+
       // Real idle detection via Electron's built-in powerMonitor
       // Returns seconds since last keyboard or mouse event — no native modules needed
       const idleTimeSeconds = powerMonitor.getSystemIdleTime()
       const activeWindowDetails = await activeWindow()
-      
-      this.pulsesSinceScreenshot++;
-      let screenshotKey: string | null = null;
-      
-      if (eventType === 'agent_start' || this.pulsesSinceScreenshot >= this.nextScreenshotThreshold) {
-         this.log(`Triggering screenshot... (eventType=${eventType})`);
-         screenshotKey = await this.takeAndUploadScreenshot();
-         this.pulsesSinceScreenshot = 0;
-         this.nextScreenshotThreshold = this.getRandomScreenshotThreshold();
+
+      // Screenshots: only for tracking pulses, not heartbeats
+      let screenshotKey: string | null = null
+      if (eventType !== 'heartbeat') {
+        this.pulsesSinceScreenshot++
+        if (eventType === 'agent_start' || this.pulsesSinceScreenshot >= this.nextScreenshotThreshold) {
+          this.log(`Triggering screenshot... (eventType=${eventType})`)
+          screenshotKey = await this.takeAndUploadScreenshot()
+          this.pulsesSinceScreenshot = 0
+          this.nextScreenshotThreshold = this.getRandomScreenshotThreshold()
+        }
       }
 
       const payload = {
         attendance_id: this.attendanceId,
-        is_active: !this.isLocked && idleTimeSeconds < 300, // Inactive if locked OR naturally idle
+        is_active: !this.isLocked && idleTimeSeconds < 180, // 3 min idle threshold
         active_window: this.isLocked ? 'Locked' : (activeWindowDetails?.title || 'Unknown'),
         app_name: this.isLocked ? 'System' : (activeWindowDetails?.owner?.name || null),
         client_timestamp: new Date().toISOString(),
-        event: eventType
+        event: eventType === 'heartbeat' ? null : eventType // backend expects agent_start/stop or null
       }
+
+      this.log(`Sending pulse: event=${payload.event}, attendance=${payload.attendance_id}, active=${payload.is_active}`)
 
       // Queue or Send
       await this.sendOrQueuePulse(payload, screenshotKey)
+
 
     } catch (e) {
       this.log(`Pulse creation failed: ${e.message}`)
