@@ -1,5 +1,5 @@
 import React, { useState } from 'react'
-import { LogIn, Settings, CheckCircle2 } from 'lucide-react'
+import { LogIn, Settings } from 'lucide-react'
 import { LogoIcon } from './LogoIcon'
 import { motion, AnimatePresence } from 'framer-motion'
 

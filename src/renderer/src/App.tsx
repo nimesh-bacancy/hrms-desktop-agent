@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Play, Square, LogOut, Clock, Coffee, Zap, Monitor, ChevronRight, Settings, Maximize2, Minimize2 } from 'lucide-react'
+import { Play, Square, LogOut, Clock, Coffee, Zap, Monitor, Maximize2, Minimize2 } from 'lucide-react'
 import Login from './components/Login'
 import { LogoIcon } from './components/LogoIcon'
 import axios from 'axios'
@@ -45,7 +45,7 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
   const [activeSeconds, setActiveSeconds] = useState(0)
   const [user, setUser] = useState<UserProfile | null>(null)
   const [dayStats, setDayStats] = useState<DayStats | null>(null)
-  const [currentApp, setCurrentApp] = useState<string>('—')
+  const [currentApp] = useState<string>('—')
   const [showIdlePrompt, setShowIdlePrompt] = useState(false)
   const [launchAtStartup, setLaunchAtStartup] = useState(false)
   const [isMini, setIsMini] = useState(false)
@@ -131,7 +131,7 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
 
   // Localized Real-time Clock
   const [currentTime, setCurrentTime] = useState(new Date())
-  const [timezone, setTimezone] = useState(Intl.DateTimeFormat().resolvedOptions().timeZone)
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000)

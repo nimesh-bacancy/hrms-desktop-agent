@@ -1,11 +1,16 @@
 import { app, powerMonitor } from 'electron'
 import { join } from 'path'
-import { promises as fs, writeFileSync, appendFileSync } from 'fs'
+import { promises as fs } from 'fs'
 import { activeWindow } from 'get-windows'
 import screenshotDesktop from 'screenshot-desktop'
 import axios from 'axios'
 import log from 'electron-log'
 // import ioHook from '@tkomde/iohook' // We will enable this cautiously
+
+const getErrorMessage = (error: unknown): string => {
+  if (error instanceof Error) return error.message
+  return String(error)
+}
 
 export class DesktopEngine {
   private queueFilePath: string
@@ -155,8 +160,8 @@ export class DesktopEngine {
         return true
       }
       return false
-    } catch (e) {
-      this.log(`Failed to Clock In via agent: ${e.message}`)
+    } catch (e: unknown) {
+      this.log(`Failed to Clock In via agent: ${getErrorMessage(e)}`)
       return false
     }
   }
@@ -178,8 +183,8 @@ export class DesktopEngine {
       })
       this.log("Automatically Clocked Out successfully.")
       this.attendanceId = null
-    } catch (e) {
-      this.log(`Failed to Clock Out via agent: ${e.message}`)
+    } catch (e: unknown) {
+      this.log(`Failed to Clock Out via agent: ${getErrorMessage(e)}`)
     }
   }
 
@@ -204,8 +209,8 @@ export class DesktopEngine {
       }
       this.attendanceId = null
       return false
-    } catch (e) {
-      this.log(`Failed to fetch attendance status: ${e.message}`)
+    } catch (e: unknown) {
+      this.log(`Failed to fetch attendance status: ${getErrorMessage(e)}`)
       return false
     }
   }
@@ -279,8 +284,8 @@ export class DesktopEngine {
       await this.sendOrQueuePulse(payload, screenshotKey)
 
 
-    } catch (e) {
-      this.log(`Pulse creation failed: ${e.message}`)
+    } catch (e: unknown) {
+      this.log(`Pulse creation failed: ${getErrorMessage(e)}`)
     }
   }
 

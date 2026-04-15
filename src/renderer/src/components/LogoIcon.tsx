@@ -1,5 +1,3 @@
-import React from 'react'
-
 export const LogoIcon = ({ size = 34 }: { size?: number }) => (
   <svg width={size} height={size} viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
     <rect width="64" height="64" rx="16" fill="#10b981"/>
