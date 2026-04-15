@@ -20,6 +20,7 @@ export class DesktopEngine {
   private trackingStartTime: string | null = null
   private heartbeatInterval: NodeJS.Timeout | null = null
   private pulseInterval: NodeJS.Timeout | null = null
+  private isPulseRunning: boolean = false
   
   // Tracking State
   private pulsesSinceScreenshot: number = 0
@@ -220,52 +221,61 @@ export class DesktopEngine {
   }
 
   private async runPulse(eventType: string | null = null) {
+    if (this.isPulseRunning) {
+      this.log('Pulse skipped: previous pulse still in progress.')
+      return
+    }
+
     try {
+      this.isPulseRunning = true
+
       // If token is missing (logged out), skip silently — don't forceStop
       if (!this.token) {
-        this.log('Pulse skipped: no auth token (user logged out).')
+        this.log('Pulse skipped: no auth token.')
         return
       }
 
-      // Determine how to handle attendance ID based on event type
-      if (eventType === 'heartbeat') {
-        // For heartbeat: try to get attendance ID silently.
-        // If not clocked in yet, just skip — don't forceStop.
-        await this.fetchAttendanceId()
-        if (!this.attendanceId) {
-          this.log('Heartbeat skipped: user not yet clocked in.')
-          return
-        }
-      } else if (eventType !== 'agent_start') {
-        // For regular pulses: strict check — forceStop if not clocked in on server
-        const ok = await this.fetchAttendanceId()
-        if (!ok) {
-          this.forceStop()
-          const { BrowserWindow } = require('electron')
-          BrowserWindow.getAllWindows().forEach(w => w.webContents.send('force-stop'))
-          return
-        }
-      } else if (!this.attendanceId && eventType === 'agent_start') {
-        // Fallback for startup
+      // Startup: ensure we have an attendance ID
+      if (eventType === 'agent_start' && !this.attendanceId) {
         const ok = await this.triggerClockIn()
         if (!ok) return
+      }
+
+      // If no ID yet (e.g. heartbeat before tracking), try one fetch
+      if (!this.attendanceId) {
+        await this.fetchAttendanceId()
+      }
+
+      // FINAL CHECK: If still no ID, skip this pulse (don't force-stop, just wait for clock-in)
+      if (!this.attendanceId) {
+        return
       }
 
 
       // Real idle detection via Electron's built-in powerMonitor
       // Returns seconds since last keyboard or mouse event — no native modules needed
       const idleTimeSeconds = powerMonitor.getSystemIdleTime()
-      const activeWindowDetails = await activeWindow()
+      
+      let activeWindowDetails = null
+      try {
+        activeWindowDetails = await activeWindow()
+      } catch (e: unknown) {
+        this.log(`Window tracking failed (continuing pulse): ${getErrorMessage(e)}`)
+      }
 
       // Screenshots: only for tracking pulses, not heartbeats
       let screenshotKey: string | null = null
       if (eventType !== 'heartbeat') {
         this.pulsesSinceScreenshot++
         if (eventType === 'agent_start' || this.pulsesSinceScreenshot >= this.nextScreenshotThreshold) {
-          this.log(`Triggering screenshot... (eventType=${eventType})`)
-          screenshotKey = await this.takeAndUploadScreenshot()
-          this.pulsesSinceScreenshot = 0
-          this.nextScreenshotThreshold = this.getRandomScreenshotThreshold()
+          try {
+            this.log(`Triggering screenshot... (eventType=${eventType})`)
+            screenshotKey = await this.takeAndUploadScreenshot()
+            this.pulsesSinceScreenshot = 0
+            this.nextScreenshotThreshold = this.getRandomScreenshotThreshold()
+          } catch (e: unknown) {
+            this.log(`Screenshot capture/upload failed: ${getErrorMessage(e)}`)
+          }
         }
       }
 
@@ -286,6 +296,12 @@ export class DesktopEngine {
 
     } catch (e: unknown) {
       this.log(`Pulse creation failed: ${getErrorMessage(e)}`)
+    } finally {
+      // In case sendOrQueuePulse wasn't reached, release the lock here
+      if (this.isPulseRunning && eventType === 'agent_start') {
+         // for agent_start, we might want to be careful, but generally we must release
+      }
+      this.isPulseRunning = false
     }
   }
 
@@ -328,11 +344,12 @@ export class DesktopEngine {
       this.log(`Screenshot uploaded to S3: ${s3Key}`)
       return s3Key
 
-    } catch (e: any) {
-      if (e?.response?.status === 503) {
+    } catch (e: unknown) {
+      const axiosError = e as any;
+      if (axiosError?.response?.status === 503) {
         this.log('Screenshot skipped: S3 not configured on server')
       } else {
-        const errorMsg = e?.response?.data ? JSON.stringify(e.response.data) : (e?.message || String(e));
+        const errorMsg = axiosError?.response?.data ? JSON.stringify(axiosError.response.data) : getErrorMessage(e);
         this.log(`Screenshot upload failed: ${errorMsg}`)
       }
       return null
@@ -385,8 +402,20 @@ export class DesktopEngine {
       
       // Since we are online, let's try to clear the queue if any exists
       this.syncOfflineQueue()
-    } catch (e) {
-      this.log('API failed, queueing offline pulse.')
+    } catch (e: any) {
+      const status = e?.response?.status
+      
+      // CRITICAL: Only stop if the server explicitly tells us the session is DEAD (401/403/404)
+      if ([401, 403, 404].includes(status)) {
+        this.log(`Attendance session invalid (Status ${status}). Stopping engine.`)
+        this.forceStop()
+        const { BrowserWindow } = require('electron')
+        BrowserWindow.getAllWindows().forEach(w => w.webContents.send('force-stop'))
+        return
+      }
+
+      // Otherwise (timeout, 500, offline), just queue it — DO NOT STOP TRACKING
+      this.log(`Pulse failed (${getErrorMessage(e)}), queueing offline. Tracking continues.`)
       try {
         let q: any[] = []
         try {
@@ -395,9 +424,11 @@ export class DesktopEngine {
         } catch (_) {}
         q.push(pulseData)
         await fs.writeFile(this.queueFilePath, JSON.stringify(q))
-      } catch (err) {
-        log.error('Could not write offline queue', err)
+      } catch (err: unknown) {
+        log.error('Could not write offline queue', getErrorMessage(err))
       }
+    } finally {
+      this.isPulseRunning = false
     }
   }
 
