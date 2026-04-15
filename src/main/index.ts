@@ -92,7 +92,7 @@ app.whenReady().then(() => {
   })
 
   // IPC handlers for Authentication & Tracking Control
-  ipcMain.on('save-auth', (event, { url, token }) => {
+  ipcMain.on('save-auth', (_, { url, token }) => {
     engine.setAuth(url, token)
   })
 
