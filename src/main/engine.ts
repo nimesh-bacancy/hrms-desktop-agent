@@ -256,7 +256,7 @@ export class DesktopEngine {
       // Returns seconds since last keyboard or mouse event — no native modules needed
       const idleTimeSeconds = powerMonitor.getSystemIdleTime()
       
-      let activeWindowDetails = null
+      let activeWindowDetails: any = null
       try {
         activeWindowDetails = await activeWindow()
       } catch (e: unknown) {
