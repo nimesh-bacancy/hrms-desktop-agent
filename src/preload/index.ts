@@ -1,20 +1,20 @@
-import { contextBridge } from 'electron'
+import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
 // Custom APIs for renderer
 const api = {
   onForceStop: (callback: () => void) => {
-    require('electron').ipcRenderer.on('force-stop-tracking', callback)
+    ipcRenderer.on('force-stop', callback)
   },
   offForceStop: (callback: () => void) => {
-    require('electron').ipcRenderer.removeListener('force-stop-tracking', callback)
+    ipcRenderer.removeListener('force-stop', callback)
   },
-  setLaunchAtStartup: (openAtLogin: boolean) => 
-    require('electron').ipcRenderer.send('set-launch-at-startup', openAtLogin),
-  getLaunchAtStartup: () => 
-    require('electron').ipcRenderer.invoke('get-launch-at-startup'),
-  toggleMini: (isMini: boolean) => 
-    require('electron').ipcRenderer.send('toggle-mini', isMini)
+  setLaunchAtStartup: (openAtLogin: boolean) =>
+    ipcRenderer.send('set-launch-at-startup', openAtLogin),
+  getLaunchAtStartup: () =>
+    ipcRenderer.invoke('get-launch-at-startup'),
+  toggleMini: (isMini: boolean) =>
+    ipcRenderer.send('toggle-mini', isMini)
 }
 
 // Use `contextBridge` APIs to expose Electron APIs to

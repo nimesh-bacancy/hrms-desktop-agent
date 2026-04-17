@@ -1,8 +1,6 @@
-import { app, powerMonitor } from 'electron'
+import { app, powerMonitor, desktopCapturer, BrowserWindow, systemPreferences } from 'electron'
 import { join } from 'path'
 import { promises as fs } from 'fs'
-import { activeWindow } from 'get-windows'
-import screenshotDesktop from 'screenshot-desktop'
 import axios from 'axios'
 import log from 'electron-log'
 // import ioHook from '@tkomde/iohook' // We will enable this cautiously
@@ -25,6 +23,9 @@ export class DesktopEngine {
   // Tracking State
   private pulsesSinceScreenshot: number = 0
   private nextScreenshotThreshold: number = 3
+  private pendingEvent: string | null = null
+
+  private isSyncingQueue: boolean = false
 
   private log(msg: string) {
     log.info(`[Engine] ${msg}`);
@@ -110,7 +111,7 @@ export class DesktopEngine {
     this.log("Tracking engine started.")
   }
 
-  public stopTracking() {
+  public async stopTracking() {
     if (!this.isTracking) return
     this.isTracking = false
     this.trackingStartTime = null
@@ -118,11 +119,25 @@ export class DesktopEngine {
       clearInterval(this.pulseInterval)
       this.pulseInterval = null
     }
-    
-    // Fire closing pulse and Clock Out
-    this.runPulse('agent_stop').then(() => {
-      this.triggerClockOut()
-    })
+
+    // If a pulse is currently in flight, wait for it to finish so agent_stop is never dropped
+    if (this.isPulseRunning) {
+      this.log('Waiting for in-flight pulse to finish before sending agent_stop...')
+      await new Promise<void>(resolve => {
+        const poll = setInterval(() => {
+          if (!this.isPulseRunning) {
+            clearInterval(poll)
+            resolve()
+          }
+        }, 100)
+        // Safety timeout: don't wait more than 15 seconds
+        setTimeout(() => { clearInterval(poll); resolve() }, 15000)
+      })
+    }
+
+    // Fire closing pulse then Clock Out
+    await this.runPulse('agent_stop')
+    await this.triggerClockOut()
     this.log("Tracking engine stopped and Clocked Out.")
   }
 
@@ -143,7 +158,8 @@ export class DesktopEngine {
     try {
       // First check if already clocked in to avoid 400 error
       const statusResp = await axios.get(`${this.apiUrl}/attendance/status`, {
-        headers: { Authorization: `Bearer ${this.token}` }
+        headers: { Authorization: `Bearer ${this.token}` },
+        timeout: 8000
       })
       if (statusResp.data && statusResp.data.is_clocked_in && statusResp.data.attendance_id) {
         this.attendanceId = statusResp.data.attendance_id
@@ -153,7 +169,8 @@ export class DesktopEngine {
 
       // If not clocked in, initiate it
       const resp = await axios.post(`${this.apiUrl}/attendance/clock-in`, {}, {
-        headers: { Authorization: `Bearer ${this.token}` }
+        headers: { Authorization: `Bearer ${this.token}` },
+        timeout: 8000
       })
       if (resp.data && resp.data.id) {
         this.attendanceId = resp.data.id
@@ -180,7 +197,8 @@ export class DesktopEngine {
     try {
       if (!this.attendanceId) return
       await axios.post(`${this.apiUrl}/attendance/clock-out`, {}, {
-        headers: { Authorization: `Bearer ${this.token}` }
+        headers: { Authorization: `Bearer ${this.token}` },
+        timeout: 8000
       })
       this.log("Automatically Clocked Out successfully.")
       this.attendanceId = null
@@ -192,17 +210,23 @@ export class DesktopEngine {
   public setPowerState(isLocked: boolean) {
     this.isLocked = isLocked
     this.log(`Power state changed. Locked: ${isLocked}`)
-    
-    // Trigger an immediate pulse to update the server instantly
+
     if (this.isTracking) {
-      this.runPulse(isLocked ? 'lock' : 'unlock')
+      if (this.isPulseRunning) {
+        // A pulse is already in flight — store the event so the next pulse picks it up
+        this.pendingEvent = isLocked ? 'lock' : 'unlock'
+        this.log(`Pulse busy — deferring ${this.pendingEvent} event to next pulse.`)
+      } else {
+        this.runPulse(isLocked ? 'lock' : 'unlock')
+      }
     }
   }
 
   private async fetchAttendanceId(): Promise<boolean> {
     try {
       const resp = await axios.get(`${this.apiUrl}/attendance/status`, {
-        headers: { Authorization: `Bearer ${this.token}` }
+        headers: { Authorization: `Bearer ${this.token}` },
+        timeout: 8000
       })
       if (resp.data && resp.data.is_clocked_in && resp.data.attendance_id) {
         this.attendanceId = resp.data.attendance_id
@@ -228,6 +252,13 @@ export class DesktopEngine {
 
     try {
       this.isPulseRunning = true
+
+      // Pick up any deferred lock/unlock event from a busy pulse slot
+      if (!eventType && this.pendingEvent) {
+        eventType = this.pendingEvent
+        this.pendingEvent = null
+        this.log(`Picked up deferred event: ${eventType}`)
+      }
 
       // If token is missing (logged out), skip silently — don't forceStop
       if (!this.token) {
@@ -257,10 +288,17 @@ export class DesktopEngine {
       const idleTimeSeconds = powerMonitor.getSystemIdleTime()
       
       let activeWindowDetails: any = null
-      try {
-        activeWindowDetails = await activeWindow()
-      } catch (e: unknown) {
-        this.log(`Window tracking failed (continuing pulse): ${getErrorMessage(e)}`)
+      // get-windows uses a native binary — dynamically import it so a missing/broken
+      // native build cannot crash the main process at startup.
+      // Also skip on Wayland (no X11 support in get-windows).
+      const isWayland = !!process.env.WAYLAND_DISPLAY
+      if (!isWayland) {
+        try {
+          const { activeWindow } = await import('get-windows')
+          activeWindowDetails = await activeWindow()
+        } catch (e: unknown) {
+          this.log(`Window tracking failed (continuing pulse): ${getErrorMessage(e)}`)
+        }
       }
 
       // Screenshots: only for tracking pulses, not heartbeats
@@ -285,6 +323,7 @@ export class DesktopEngine {
         active_window: this.isLocked ? 'Locked' : (activeWindowDetails?.title || 'Unknown'),
         app_name: this.isLocked ? 'System' : (activeWindowDetails?.owner?.name || null),
         client_timestamp: new Date().toISOString(),
+        platform: process.platform,
         event: eventType === 'heartbeat' ? null : eventType // backend expects agent_start/stop or null
       }
 
@@ -306,36 +345,77 @@ export class DesktopEngine {
   }
 
   private async takeAndUploadScreenshot(): Promise<string | null> {
-    try {
-      // Step 1: Capture screenshot as a Buffer
-      const imgBuffer = await screenshotDesktop() as Buffer
+    // Step 1: Capture screenshot using Electron's desktopCapturer (no external OS tools needed)
+    this.log('Capturing screen...')
+    let imgBuffer: Buffer
 
-      // Step 2: Get presigned POST data from backend
+    try {
+      // macOS 10.15+: check Screen Recording permission before attempting capture.
+      // Without it, getSources() succeeds but thumbnails are empty black images.
+      if (process.platform === 'darwin') {
+        const access = systemPreferences.getMediaAccessStatus('screen')
+        if (access !== 'granted') {
+          this.log(`Screenshot skipped: macOS Screen Recording permission is '${access}'. Grant it in System Settings → Privacy & Security → Screen Recording.`)
+          return null
+        }
+      }
+
+      const capturePromise = desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 1920, height: 1080 }
+      })
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Screenshot capture timed out after 10s')), 10000)
+      )
+      const sources = await Promise.race([capturePromise, timeoutPromise])
+
+      if (!sources.length) {
+        // Common on Linux Wayland without PipeWire — skip gracefully
+        this.log('Screenshot capture failed: no screen sources found (Wayland without PipeWire?)')
+        return null
+      }
+
+      imgBuffer = sources[0].thumbnail.toJPEG(85)
+
+      // Guard against empty thumbnails (macOS permission silently denied, or Wayland fallback)
+      if (imgBuffer.length < 1000) {
+        this.log(`Screenshot capture failed: thumbnail is empty (${imgBuffer.length} bytes) — permission may be missing`)
+        return null
+      }
+
+      this.log(`Screen captured successfully (${imgBuffer.length} bytes)`)
+    } catch (e: unknown) {
+      this.log(`Screenshot capture failed: ${getErrorMessage(e)}`)
+      return null
+    }
+
+    // Step 2: Get presigned POST data from backend
+    try {
       const uploadUrlResp = await axios.get(`${this.apiUrl}/activities/screenshot-upload-url`, {
         params: { file_name: 'screenshot.jpg', content_type: 'image/jpeg' },
-        headers: { Authorization: `Bearer ${this.token}` }
+        headers: { Authorization: `Bearer ${this.token}` },
+        timeout: 8000
       })
 
       const { url: postUrl, fields } = uploadUrlResp.data
       if (!postUrl || !fields) {
-        this.log('Presigned POST response missing url/fields')
+        this.log('Screenshot upload failed: presigned POST response missing url/fields')
         return null
       }
       this.log(`Presigned URL generated: ${postUrl}, fields: ${Object.keys(fields).join(',')}`)
 
-      // Step 3: POST file directly to S3 using FormData
-      const FormData = require('form-data')
+      // Step 3: POST file directly to S3 using native FormData + Blob (Node 18+, no external package)
       const form = new FormData()
-      Object.entries(fields).forEach(([k, v]) => form.append(k, v))
-      form.append('file', imgBuffer, { filename: 'screenshot.jpg', contentType: 'image/jpeg' })
+      Object.entries(fields).forEach(([k, v]) => form.append(k, v as string))
+      form.append('file', new Blob([imgBuffer], { type: 'image/jpeg' }), 'screenshot.jpg')
 
       const s3Resp = await axios.post(postUrl, form, {
-        headers: form.getHeaders(),
-        maxBodyLength: Infinity
+        maxBodyLength: Infinity,
+        timeout: 30000 // 30s — S3 uploads can be slower than API calls
       })
 
       if (![200, 204].includes(s3Resp.status)) {
-        console.error('S3 upload rejected:', s3Resp.status)
+        this.log(`Screenshot upload failed: S3 rejected with status ${s3Resp.status}`)
         return null
       }
 
@@ -345,11 +425,13 @@ export class DesktopEngine {
       return s3Key
 
     } catch (e: unknown) {
-      const axiosError = e as any;
+      const axiosError = e as any
       if (axiosError?.response?.status === 503) {
         this.log('Screenshot skipped: S3 not configured on server')
       } else {
-        const errorMsg = axiosError?.response?.data ? JSON.stringify(axiosError.response.data) : getErrorMessage(e);
+        const errorMsg = axiosError?.response?.data
+          ? JSON.stringify(axiosError.response.data)
+          : getErrorMessage(e)
         this.log(`Screenshot upload failed: ${errorMsg}`)
       }
       return null
@@ -358,33 +440,53 @@ export class DesktopEngine {
 
   public async syncOfflineQueue() {
     if (!this.token || !this.apiUrl) return
-    
-    try {
-      const content = await fs.readFile(this.queueFilePath, 'utf8')
-      const queue: any[] = JSON.parse(content)
-      if (queue.length === 0) return
+    if (this.isSyncingQueue) return // Prevent duplicate concurrent sync execution
 
+    try {
+      this.isSyncingQueue = true
+      
+      let queue: any[] = []
+      try {
+        const content = await fs.readFile(this.queueFilePath, 'utf8')
+        queue = JSON.parse(content)
+        // Immediately clear the queue so new offline pulses can be appended safely without collision
+        await fs.writeFile(this.queueFilePath, '[]')
+      } catch (_) {
+        return // File missing or empty
+      }
+
+      if (queue.length === 0) return
       this.log(`Syncing ${queue.length} offline pulses...`)
       
-      const remaining: any[] = []
+      const failedPulses: any[] = []
       for (const pulse of queue) {
         try {
           await axios.post(`${this.apiUrl}/activities/desktop-pulse`, pulse, {
-            headers: { Authorization: `Bearer ${this.token}` }
+            headers: { Authorization: `Bearer ${this.token}` },
+            timeout: 8000 // Ensure it doesn't hang indefinitely
           })
         } catch (e) {
-          remaining.push(pulse)
+          failedPulses.push(pulse)
         }
       }
 
-      await fs.writeFile(this.queueFilePath, JSON.stringify(remaining))
-      if (remaining.length === 0) {
-        this.log('Offline queue fully synced.')
+      // If any pulses failed during the sync, carefully merge them back into the disk file
+      // to ensure pulses recorded during the sync aren't overwritten.
+      if (failedPulses.length > 0) {
+        try {
+          let currentQ: any[] = []
+          try {
+            const currentContent = await fs.readFile(this.queueFilePath, 'utf8')
+            currentQ = JSON.parse(currentContent)
+          } catch (_) {}
+          await fs.writeFile(this.queueFilePath, JSON.stringify([...failedPulses, ...currentQ]))
+        } catch (err) { }
+        this.log(`Partial sync completed, ${failedPulses.length} pulses restored to queue.`)
       } else {
-        this.log(`Partial sync completed, ${remaining.length} pulses still queued.`)
+        this.log('Offline queue fully synced.')
       }
-    } catch (err) {
-      // File missing or corrupt, treat as empty
+    } finally {
+      this.isSyncingQueue = false
     }
   }
 
@@ -396,20 +498,20 @@ export class DesktopEngine {
 
     try {
       await axios.post(`${this.apiUrl}/activities/desktop-pulse`, pulseData, {
-        headers: { Authorization: `Bearer ${this.token}` }
+        headers: { Authorization: `Bearer ${this.token}` },
+        timeout: 10000 // Prevent a hanging request from locking isPulseRunning forever
       })
       this.log('Successfully sent pulse to backend.')
-      
+
       // Since we are online, let's try to clear the queue if any exists
       this.syncOfflineQueue()
     } catch (e: any) {
       const status = e?.response?.status
-      
+
       // CRITICAL: Only stop if the server explicitly tells us the session is DEAD (401/403/404)
       if ([401, 403, 404].includes(status)) {
         this.log(`Attendance session invalid (Status ${status}). Stopping engine.`)
         this.forceStop()
-        const { BrowserWindow } = require('electron')
         BrowserWindow.getAllWindows().forEach(w => w.webContents.send('force-stop'))
         return
       }
@@ -427,9 +529,8 @@ export class DesktopEngine {
       } catch (err: unknown) {
         log.error('Could not write offline queue', getErrorMessage(err))
       }
-    } finally {
-      this.isPulseRunning = false
     }
+    // Note: isPulseRunning is released exclusively in runPulse's finally block
   }
 
   public destroy() {

@@ -1,6 +1,6 @@
 {
   "name": "workpulse-agent",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "packageManager": "npm@10.9.2",
   "description": "An Electron application with React and TypeScript",
   "main": "./out/main/index.js",
@@ -16,10 +16,11 @@
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "postinstall": "node scripts/postinstall.cjs",
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true }); require('fs').rmSync('out', { recursive: true, force: true });\"",
     "build:unpack": "npm run build && electron-builder --dir",
-    "build:win": "npm run build && electron-builder --win",
-    "build:mac": "electron-vite build && electron-builder --mac",
-    "build:linux": "electron-vite build && electron-builder --linux"
+    "build:win": "npm run clean && npm run build && electron-builder --win",
+    "build:mac": "npm run clean && electron-vite build && electron-builder --mac",
+    "build:linux": "npm run clean && electron-vite build && electron-builder --linux"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
@@ -31,7 +32,6 @@
     "framer-motion": "^12.38.0",
     "get-windows": "^9.0.0",
     "lucide-react": "^1.8.0",
-    "screenshot-desktop": "^1.15.0",
     "tailwind-merge": "^3.5.0",
     "zustand": "^5.0.12"
   },

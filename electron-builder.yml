@@ -28,6 +28,7 @@ mac:
     - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
     - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
     - NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
+    - NSScreenCaptureUsageDescription: Application requests access to the device's screen for activity tracking.
   notarize: false
 dmg:
   artifactName: ${name}-${version}.${ext}
@@ -40,7 +41,6 @@ linux:
   category: Utility
 appImage:
   artifactName: ${name}-${version}.${ext}
-npmRebuild: false
 publish:
   provider: generic
   url: https://api.projectsoftware.com/api/v1/system/agent-release/

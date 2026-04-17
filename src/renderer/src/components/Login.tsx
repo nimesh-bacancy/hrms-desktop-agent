@@ -232,7 +232,15 @@ const Login = ({ onLoginSuccess }: { onLoginSuccess: (url: string, token: string
                 
                 {showAdvanced && (
                   <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} style={{ overflow: 'hidden', marginTop: '12px' }}>
-                    <label style={{ fontSize: '0.7rem', color: 'var(--wp-text-mute)' }}>API Persistence Engine URL</label>
+                    <label style={{ fontSize: '0.7rem', color: 'var(--wp-text-mute)', display: 'flex', justifyContent: 'space-between' }}>
+                      <span>API Persistence Engine URL</span>
+                      <span 
+                        style={{ color: 'var(--wp-accent)', cursor: 'pointer', fontWeight: 600 }} 
+                        onClick={() => setApiUrl('http://localhost:8001/api/v1')}
+                      >
+                        Use Localhost
+                      </span>
+                    </label>
                     <input
                       type="text"
                       value={apiUrl}
