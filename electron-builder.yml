@@ -1,5 +1,6 @@
 appId: com.electron.app
 productName: WorkPulse Agent
+npmRebuild: false
 directories:
   buildResources: build
 files:
