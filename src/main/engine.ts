@@ -19,13 +19,17 @@ export class DesktopEngine {
   private heartbeatInterval: NodeJS.Timeout | null = null
   private pulseInterval: NodeJS.Timeout | null = null
   private isPulseRunning: boolean = false
-  
+
   // Tracking State
   private pulsesSinceScreenshot: number = 0
   private nextScreenshotThreshold: number = 3
   private pendingEvent: string | null = null
 
   private isSyncingQueue: boolean = false
+
+  // Day-boundary rollover
+  private userTimezone: string = 'UTC'
+  private trackingDate: string | null = null
 
   private log(msg: string) {
     log.info(`[Engine] ${msg}`);
@@ -60,6 +64,7 @@ export class DesktopEngine {
     }
 
     if (isLoggingIn) {
+      this.fetchUserTimezone()
       // Resume heartbeat immediately
       this.startHeartbeat()
       // If we were tracking before logout, resume the pulse loop
@@ -74,6 +79,7 @@ export class DesktopEngine {
 
     // First-time login (no prior token)
     if (this.token && !this.heartbeatInterval) {
+      this.fetchUserTimezone()
       this.startHeartbeat()
     }
     this.syncOfflineQueue()
@@ -100,6 +106,7 @@ export class DesktopEngine {
     this.triggerClockIn().then((success) => {
       if (success) {
         this.trackingStartTime = new Date().toISOString()
+        this.trackingDate = this.getCurrentDateInTimezone()
         // Fire an immediate pulse to register the 'agent_start'
         this.runPulse('agent_start')
       }
@@ -115,6 +122,7 @@ export class DesktopEngine {
     if (!this.isTracking) return
     this.isTracking = false
     this.trackingStartTime = null
+    this.trackingDate = null
     if (this.pulseInterval) {
       clearInterval(this.pulseInterval)
       this.pulseInterval = null
@@ -146,12 +154,92 @@ export class DesktopEngine {
     if (!this.isTracking) return
     this.isTracking = false
     this.trackingStartTime = null
+    this.trackingDate = null
     if (this.pulseInterval) {
       clearInterval(this.pulseInterval)
       this.pulseInterval = null
     }
     this.attendanceId = null
     this.log("Tracking forcefully stopped because HRMS says user is clocked out.")
+  }
+
+  private getCurrentDateInTimezone(): string {
+    try {
+      return new Date().toLocaleDateString('en-CA', { timeZone: this.userTimezone }) // YYYY-MM-DD
+    } catch {
+      return new Date().toLocaleDateString('en-CA') // fallback to system tz
+    }
+  }
+
+  private async fetchUserTimezone(): Promise<void> {
+    try {
+      const resp = await axios.get(`${this.apiUrl}/users/me`, {
+        headers: { Authorization: `Bearer ${this.token}` },
+        timeout: 8000
+      })
+      if (resp.data?.timezone) {
+        this.userTimezone = resp.data.timezone
+        this.log(`User timezone: ${this.userTimezone}`)
+      }
+    } catch (e: unknown) {
+      this.log(`Could not fetch user timezone, using ${this.userTimezone}: ${getErrorMessage(e)}`)
+    }
+  }
+
+  private async executeMidnightRollover(newDate: string): Promise<void> {
+    if (this.isPulseRunning) return
+    this.isPulseRunning = true
+    this.log(`Midnight rollover: ${this.trackingDate} → ${newDate} (${this.userTimezone})`)
+
+    try {
+      const prevAttendanceId = this.attendanceId
+
+      // 1. Close previous day — send agent_stop pulse then clock out
+      if (prevAttendanceId) {
+        await this.sendOrQueuePulse({
+          attendance_id: prevAttendanceId,
+          is_active: false,
+          event: 'agent_stop',
+          client_timestamp: new Date().toISOString(),
+          platform: process.platform,
+          active_window: null,
+          app_name: null
+        }, null)
+      }
+      await this.triggerClockOut()
+
+      // 2. Open new day — clock in then send agent_start pulse
+      const ok = await this.triggerClockIn()
+      if (!ok) {
+        this.log('Midnight rollover: clock-in for new day failed. Stopping tracking.')
+        this.isTracking = false
+        if (this.pulseInterval) { clearInterval(this.pulseInterval); this.pulseInterval = null }
+        BrowserWindow.getAllWindows().forEach(w => w.webContents.send('force-stop'))
+        return
+      }
+
+      this.trackingDate = newDate
+      this.trackingStartTime = new Date().toISOString()
+
+      if (this.attendanceId) {
+        await this.sendOrQueuePulse({
+          attendance_id: this.attendanceId,
+          is_active: true,
+          event: 'agent_start',
+          client_timestamp: new Date().toISOString(),
+          platform: process.platform,
+          active_window: null,
+          app_name: null
+        }, null)
+      }
+
+      this.log(`Midnight rollover complete. Now tracking date: ${newDate}`)
+      BrowserWindow.getAllWindows().forEach(w => w.webContents.send('day-rolled-over'))
+    } catch (e: unknown) {
+      this.log(`Midnight rollover error: ${getErrorMessage(e)}`)
+    } finally {
+      this.isPulseRunning = false
+    }
   }
 
   private async triggerClockIn(): Promise<boolean> {
@@ -281,7 +369,19 @@ export class DesktopEngine {
       if (!this.attendanceId) {
         return
       }
+      // Snapshot the ID now — forceStop() can null this.attendanceId during async awaits below
+      const snapshotAttendanceId = this.attendanceId
 
+      // Day-boundary check: if midnight has passed in the user's timezone, roll over to new day
+      if (this.isTracking && this.trackingDate) {
+        const todayInUserTz = this.getCurrentDateInTimezone()
+        if (todayInUserTz !== this.trackingDate) {
+          this.log(`Day boundary crossed: ${this.trackingDate} → ${todayInUserTz} (${this.userTimezone})`)
+          // Schedule rollover after this pulse slot releases isPulseRunning
+          setTimeout(() => this.executeMidnightRollover(todayInUserTz), 0)
+          return
+        }
+      }
 
       // Real idle detection via Electron's built-in powerMonitor
       // Returns seconds since last keyboard or mouse event — no native modules needed
@@ -318,7 +418,7 @@ export class DesktopEngine {
       }
 
       const payload = {
-        attendance_id: this.attendanceId,
+        attendance_id: snapshotAttendanceId,
         is_active: !this.isLocked && idleTimeSeconds < 180, // 3 min idle threshold
         active_window: this.isLocked ? 'Locked' : (activeWindowDetails?.title || 'Unknown'),
         app_name: this.isLocked ? 'System' : (activeWindowDetails?.owner?.name || null),

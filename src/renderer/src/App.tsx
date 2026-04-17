@@ -12,6 +12,7 @@ interface UserProfile {
   email: string
   profile_picture?: string | null
   role?: string
+  timezone?: string
 }
 
 interface DayStats {
@@ -99,6 +100,10 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
           axios.get(`${apiUrl}/attendance/status`, { headers: authHeaders })
         ])
         setUser(usersResp.data)
+        if (usersResp.data?.timezone) {
+          setTimezone(usersResp.data.timezone)
+          localStorage.setItem('wp_user_timezone', usersResp.data.timezone)
+        }
         setDayStats(statusResp.data)
         
         // Sync with background engine status
@@ -129,9 +134,11 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
     fetchData()
   }, [])
 
-  // Localized Real-time Clock
+  // Localized Real-time Clock — seeded from localStorage so the correct tz shows immediately on mount
   const [currentTime, setCurrentTime] = useState(new Date())
-  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
+  const [timezone, setTimezone] = useState<string>(
+    () => localStorage.getItem('wp_user_timezone') || Intl.DateTimeFormat().resolvedOptions().timeZone
+  )
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000)
@@ -343,11 +350,11 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
             </h1>
             <p style={{ color: 'var(--wp-text-mute)', fontSize: '0.85rem', margin: '4px 0 0 0', display: 'flex', alignItems: 'center', gap: '8px' }}>
                <span style={{ color: 'var(--wp-accent)', fontWeight: 600, fontVariantNumeric: 'tabular-nums' }}>
-                 {currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                 {currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: timezone })}
                </span>
                <span style={{ fontSize: '0.7rem', opacity: 0.8 }}>({timezone})</span>
                <span style={{ opacity: 0.3 }}>•</span>
-               <span>{currentTime.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+               <span>{currentTime.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', timeZone: timezone })}</span>
                <span style={{ opacity: 0.3 }}>•</span>
                <span style={{ fontSize: '0.7rem', color: 'var(--wp-success)', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '4px' }}>
                   <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: 'currentColor' }} />
