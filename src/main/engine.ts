@@ -507,7 +507,7 @@ export class DesktopEngine {
       // Step 3: POST file directly to S3 using native FormData + Blob (Node 18+, no external package)
       const form = new FormData()
       Object.entries(fields).forEach(([k, v]) => form.append(k, v as string))
-      form.append('file', new Blob([imgBuffer], { type: 'image/jpeg' }), 'screenshot.jpg')
+      form.append('file', new Blob([new Uint8Array(imgBuffer)], { type: 'image/jpeg' }), 'screenshot.jpg')
 
       const s3Resp = await axios.post(postUrl, form, {
         maxBodyLength: Infinity,
