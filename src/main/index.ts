@@ -304,6 +304,7 @@ if (!gotTheLock) {
 
   // Graceful shutdown — ensure we clock out if the user force quits the app
   app.on('before-quit', () => {
+    isQuitting = true
     log.info('Application quitting. Stopping tracking...')
     engine.stopTracking()
   })

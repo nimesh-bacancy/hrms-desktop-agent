@@ -1,4 +1,4 @@
-appId: com.electron.app
+appId: com.workpulse.agent
 productName: WorkPulse Agent
 npmRebuild: false
 directories:
@@ -14,13 +14,25 @@ asarUnpack:
   - resources/**
 win:
   executableName: workpulse-agent-electron
-  # certificateFile: "path/to/your/certificate.pfx" # TODO: Add your .pfx file path
-  # certificatePassword: "YOUR_PASSWORD"          # TODO: Add your password or use environment variable CSC_PASSWORD
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+  # certificateFile: "path/to/your/certificate.pfx"
+  # certificatePassword: "YOUR_PASSWORD"
 nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: false
+  perMachine: false
   artifactName: ${name}-${version}-setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: always
+  createStartMenuShortcut: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
 mac:
   entitlementsInherit: build/entitlements.mac.plist
   # identity: "Apple Development: Your Name (ID)"  # TODO: Add your Apple Developer ID

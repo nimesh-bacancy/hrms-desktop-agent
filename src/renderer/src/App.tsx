@@ -63,6 +63,9 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
   }
   const timerRef = useRef<NodeJS.Timeout | null>(null)
   const promptFiredRef = useRef<boolean>(false)
+  const wasAutoStoppedRef = useRef<boolean>(false)
+  const activityWatchRef = useRef<NodeJS.Timeout | null>(null)
+  const [autoClockInNotice, setAutoClockInNotice] = useState(false)
 
   const authHeaders = { Authorization: `Bearer ${token}` }
 
@@ -182,9 +185,10 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
           const AUTO_STOP_THRESHOLD = 300 // 5 minutes
           
           if (systemIdle >= AUTO_STOP_THRESHOLD) {
+             wasAutoStoppedRef.current = true
              setIsActive(false)
              setShowIdlePrompt(false)
-             return 
+             return
           }
           
           const currentlyIdle = systemIdle >= IDLE_PROMPT_THRESHOLD
@@ -214,6 +218,41 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
     }
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
+    }
+  }, [isActive])
+
+  // Activity watcher — only runs after an AUTO stop (not manual clock-out)
+  // Polls every 5s; when user touches keyboard/mouse, auto-clocks back in
+  useEffect(() => {
+    if (activityWatchRef.current) {
+      clearInterval(activityWatchRef.current)
+      activityWatchRef.current = null
+    }
+
+    if (!isActive && wasAutoStoppedRef.current) {
+      activityWatchRef.current = setInterval(async () => {
+        try {
+          const idleTime: number = await window.electron.ipcRenderer.invoke('get-idle-time')
+          if (idleTime < 30) {
+            wasAutoStoppedRef.current = false
+            clearInterval(activityWatchRef.current!)
+            activityWatchRef.current = null
+            setSessionSeconds(0)
+            setIdleSeconds(0)
+            setActiveSeconds(0)
+            setIsActive(true)
+            setAutoClockInNotice(true)
+            setTimeout(() => setAutoClockInNotice(false), 5000)
+          }
+        } catch (_) {}
+      }, 5000)
+    }
+
+    return () => {
+      if (activityWatchRef.current) {
+        clearInterval(activityWatchRef.current)
+        activityWatchRef.current = null
+      }
     }
   }, [isActive])
 
@@ -508,6 +547,26 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
         </div>
 
       </div>
+
+      {/* AUTO CLOCK-IN NOTICE */}
+      <AnimatePresence>
+        {autoClockInNotice && (
+          <motion.div
+            initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}
+            style={{
+              position: 'fixed', top: '16px', left: '50%', transform: 'translateX(-50%)',
+              background: 'rgba(16,185,129,0.15)', border: '1px solid var(--wp-success)',
+              borderRadius: '12px', padding: '12px 24px', zIndex: 1000,
+              display: 'flex', alignItems: 'center', gap: '10px', backdropFilter: 'blur(10px)'
+            }}
+          >
+            <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: 'var(--wp-success)', boxShadow: '0 0 8px var(--wp-success)' }} />
+            <span style={{ color: 'var(--wp-success)', fontWeight: 600, fontSize: '0.85rem' }}>
+              Welcome back! Tracking resumed automatically.
+            </span>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* IDLE PROMPT MODAL OVERLAY */}
       <AnimatePresence>
