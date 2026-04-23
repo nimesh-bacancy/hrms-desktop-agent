@@ -26,10 +26,14 @@ export class DesktopEngine {
   private pendingEvent: string | null = null
 
   private isSyncingQueue: boolean = false
+  private isOnBreak: boolean = false
 
   // Day-boundary rollover
   private userTimezone: string = 'UTC'
   private trackingDate: string | null = null
+  // Resolved once fetchUserTimezone() completes so startTracking() can wait for the correct tz
+  private _tzReadyResolve: (() => void) | null = null
+  private _tzReady: Promise<void> = new Promise(res => { this._tzReadyResolve = res })
 
   private log(msg: string) {
     log.info(`[Engine] ${msg}`);
@@ -64,6 +68,8 @@ export class DesktopEngine {
     }
 
     if (isLoggingIn) {
+      // Reset timezone promise so startTracking() waits for the fresh fetch
+      this._tzReady = new Promise(res => { this._tzReadyResolve = res })
       this.fetchUserTimezone()
       // Resume heartbeat immediately
       this.startHeartbeat()
@@ -79,6 +85,7 @@ export class DesktopEngine {
 
     // First-time login (no prior token)
     if (this.token && !this.heartbeatInterval) {
+      this._tzReady = new Promise(res => { this._tzReadyResolve = res })
       this.fetchUserTimezone()
       this.startHeartbeat()
     }
@@ -101,21 +108,22 @@ export class DesktopEngine {
   public startTracking() {
     if (this.isTracking || !this.token) return
     this.isTracking = true
-    
-    // Automatically Clock In and fetch Attendance first
-    this.triggerClockIn().then((success) => {
-      if (success) {
-        this.trackingStartTime = new Date().toISOString()
-        this.trackingDate = this.getCurrentDateInTimezone()
-        // Fire an immediate pulse to register the 'agent_start'
-        this.runPulse('agent_start')
-      }
-    })
 
-    // Pulse every 60 seconds
+    // Pulse every 60 seconds (start immediately; agent_start fires after tz + clock-in settle)
     this.pulseInterval = setInterval(() => this.runPulse(), 60000)
-    
     this.log("Tracking engine started.")
+
+    // Wait for timezone to be known before setting trackingDate, then clock in
+    this._tzReady.then(() => {
+      if (!this.isTracking) return // user may have stopped while we waited
+      this.triggerClockIn().then((success) => {
+        if (success) {
+          this.trackingStartTime = new Date().toISOString()
+          this.trackingDate = this.getCurrentDateInTimezone()
+          this.runPulse('agent_start')
+        }
+      })
+    })
   }
 
   public async stopTracking() {
@@ -183,6 +191,9 @@ export class DesktopEngine {
       }
     } catch (e: unknown) {
       this.log(`Could not fetch user timezone, using ${this.userTimezone}: ${getErrorMessage(e)}`)
+    } finally {
+      // Always resolve so startTracking() never blocks indefinitely
+      if (this._tzReadyResolve) { this._tzReadyResolve(); this._tzReadyResolve = null }
     }
   }
 
@@ -295,6 +306,11 @@ export class DesktopEngine {
     }
   }
 
+  public setBreakState(onBreak: boolean) {
+    this.isOnBreak = onBreak
+    this.log(`Break state: ${onBreak ? 'started' : 'ended'}`)
+  }
+
   public setPowerState(isLocked: boolean) {
     this.isLocked = isLocked
     this.log(`Power state changed. Locked: ${isLocked}`)
@@ -386,24 +402,27 @@ export class DesktopEngine {
       // Real idle detection via Electron's built-in powerMonitor
       // Returns seconds since last keyboard or mouse event — no native modules needed
       const idleTimeSeconds = powerMonitor.getSystemIdleTime()
-      
+
+      // During break: suppress window tracking and screenshots — user has privacy while away
       let activeWindowDetails: any = null
-      // get-windows uses a native binary — dynamically import it so a missing/broken
-      // native build cannot crash the main process at startup.
-      // Also skip on Wayland (no X11 support in get-windows).
-      const isWayland = !!process.env.WAYLAND_DISPLAY
-      if (!isWayland) {
-        try {
-          const { activeWindow } = await import('get-windows')
-          activeWindowDetails = await activeWindow()
-        } catch (e: unknown) {
-          this.log(`Window tracking failed (continuing pulse): ${getErrorMessage(e)}`)
+      if (!this.isOnBreak) {
+        // get-windows uses a native binary — dynamically import it so a missing/broken
+        // native build cannot crash the main process at startup.
+        // Also skip on Wayland (no X11 support in get-windows).
+        const isWayland = !!process.env.WAYLAND_DISPLAY
+        if (!isWayland) {
+          try {
+            const { activeWindow } = await import('get-windows')
+            activeWindowDetails = await activeWindow()
+          } catch (e: unknown) {
+            this.log(`Window tracking failed (continuing pulse): ${getErrorMessage(e)}`)
+          }
         }
       }
 
-      // Screenshots: only for tracking pulses, not heartbeats
+      // Screenshots: only for tracking pulses, not heartbeats, and never during break
       let screenshotKey: string | null = null
-      if (eventType !== 'heartbeat') {
+      if (eventType !== 'heartbeat' && !this.isOnBreak) {
         this.pulsesSinceScreenshot++
         if (eventType === 'agent_start' || this.pulsesSinceScreenshot >= this.nextScreenshotThreshold) {
           try {
@@ -419,15 +438,30 @@ export class DesktopEngine {
 
       const payload = {
         attendance_id: snapshotAttendanceId,
-        is_active: !this.isLocked && idleTimeSeconds < 180, // 3 min idle threshold
-        active_window: this.isLocked ? 'Locked' : (activeWindowDetails?.title || 'Unknown'),
-        app_name: this.isLocked ? 'System' : (activeWindowDetails?.owner?.name || null),
+        // On break: always report inactive so no active time is credited
+        is_active: !this.isOnBreak && !this.isLocked && idleTimeSeconds < 180,
+        active_window: this.isOnBreak ? null : (this.isLocked ? 'Locked' : (activeWindowDetails?.title || 'Unknown')),
+        app_name: this.isOnBreak ? null : (this.isLocked ? 'System' : (activeWindowDetails?.owner?.name || null)),
         client_timestamp: new Date().toISOString(),
         platform: process.platform,
         event: eventType === 'heartbeat' ? null : eventType // backend expects agent_start/stop or null
       }
 
-      this.log(`Sending pulse: event=${payload.event}, attendance=${payload.attendance_id}, active=${payload.is_active}`)
+      this.log(`Sending pulse: event=${payload.event}, attendance=${payload.attendance_id}, active=${payload.is_active}, onBreak=${this.isOnBreak}`)
+
+      // Push active window title to renderer for live display (suppressed on break)
+      if (!this.isOnBreak) {
+        const displayWindow = this.isLocked
+          ? 'Screen Locked'
+          : (activeWindowDetails?.owner?.name
+              ? `${activeWindowDetails.owner.name}`
+              : (activeWindowDetails?.title || null))
+        if (displayWindow) {
+          BrowserWindow.getAllWindows().forEach(w =>
+            w.webContents.send('active-window-update', displayWindow)
+          )
+        }
+      }
 
       // Queue or Send
       await this.sendOrQueuePulse(payload, screenshotKey)
@@ -563,9 +597,15 @@ export class DesktopEngine {
         try {
           await axios.post(`${this.apiUrl}/activities/desktop-pulse`, pulse, {
             headers: { Authorization: `Bearer ${this.token}` },
-            timeout: 8000 // Ensure it doesn't hang indefinitely
+            timeout: 8000
           })
-        } catch (e) {
+        } catch (e: any) {
+          const status = e?.response?.status
+          // 401/403/404 = session dead or auth invalid — discard, don't retry forever
+          if (status === 401 || status === 403 || status === 404) {
+            this.log(`Discarding stale queued pulse (HTTP ${status}): attendance_id=${pulse.attendance_id}`)
+            continue
+          }
           failedPulses.push(pulse)
         }
       }

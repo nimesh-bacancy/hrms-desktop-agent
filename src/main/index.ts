@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, powerMonitor, Notification, Tray, Menu } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, powerMonitor, Notification, Tray, Menu, dialog } from 'electron'
 import { join } from 'path'
 import { promises as fs } from 'fs'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
@@ -69,10 +69,24 @@ app.whenReady().then(() => {
   const contextMenu = Menu.buildFromTemplate([
     { label: 'Open WorkPulse', click: () => mainWindow?.show() },
     { type: 'separator' },
-    { label: 'Quit WorkPulse', click: () => {
+    { label: 'Quit WorkPulse', click: async () => {
+        if (engine.getStatus().isTracking) {
+          const { response } = await dialog.showMessageBox({
+            type: 'warning',
+            title: 'Agent is still tracking',
+            message: 'Quitting will turn off the WorkPulse agent and stop monitoring.',
+            detail: 'Use "Stop Tracking" inside the app instead of quitting, so your session closes cleanly.\n\nIf you quit now your attendance session will stay open until the end-of-day auto-close.',
+            buttons: ['Keep Agent Running', 'Stop Tracking & Quit'],
+            defaultId: 0,
+            cancelId: 0,
+          })
+          if (response === 0) return // user chose to keep it running
+          // response === 1 → stop tracking gracefully then quit
+          await engine.stopTracking()
+        }
         isQuitting = true
         app.quit()
-      } 
+      }
     }
   ])
   tray.setToolTip('WorkPulse Desktop Agent')
@@ -111,9 +125,13 @@ app.whenReady().then(() => {
     engine.stopTracking()
   })
 
-  // Provide realtime idle time to the frontend dashboard 
+  // Provide realtime idle time to the frontend dashboard
   ipcMain.handle('get-idle-time', () => {
     return powerMonitor.getSystemIdleTime()
+  })
+
+  ipcMain.handle('get-app-version', () => {
+    return app.getVersion()
   })
 
   // Provide engine status and start time to the renderer
@@ -245,6 +263,10 @@ app.whenReady().then(() => {
   })
   // ──────────────────────────────────────────────────────────────────────────
 
+  ipcMain.on('set-break-state', (_, onBreak: boolean) => {
+    engine.setBreakState(onBreak)
+  })
+
   ipcMain.on('trigger-sync', () => {
     log.info('Manual sync triggered.')
     engine.syncOfflineQueue()
@@ -302,11 +324,14 @@ if (!gotTheLock) {
     }
   })
 
-  // Graceful shutdown — ensure we clock out if the user force quits the app
+  // Graceful shutdown — best-effort stop on any quit path (OS shutdown, kill signal, etc.)
+  // The tray "Quit" handler already does a clean async stopTracking(); this is a safety net.
   app.on('before-quit', () => {
     isQuitting = true
     log.info('Application quitting. Stopping tracking...')
-    engine.stopTracking()
+    if (engine.getStatus().isTracking) {
+      engine.stopTracking()
+    }
   })
 }
 

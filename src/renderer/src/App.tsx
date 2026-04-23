@@ -41,20 +41,41 @@ const formatHours = (hours: number): string => {
 // ─── Dashboard ────────────────────────────────────────────────────────────────
 const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: string; token: string }) => {
   const [isActive, setIsActive] = useState(false)
+  const [isOnBreak, setIsOnBreak] = useState(false)
   const [sessionSeconds, setSessionSeconds] = useState(0)
   const [idleSeconds, setIdleSeconds] = useState(0)
   const [activeSeconds, setActiveSeconds] = useState(0)
   const [user, setUser] = useState<UserProfile | null>(null)
-  const [dayStats, setDayStats] = useState<DayStats | null>(null)
-  const [currentApp] = useState<string>('—')
+  const [, setDayStats] = useState<DayStats | null>(null)
+  const [currentApp, setCurrentApp] = useState<string>('—')
   const [showIdlePrompt, setShowIdlePrompt] = useState(false)
   const [launchAtStartup, setLaunchAtStartup] = useState(false)
+  const [appVersion, setAppVersion] = useState<string>('')
   const [isMini, setIsMini] = useState(false)
 
   useEffect(() => {
     // @ts-ignore
     window.api.getLaunchAtStartup().then(setLaunchAtStartup)
   }, [])
+
+  useEffect(() => {
+    window.electron.ipcRenderer.invoke('get-app-version').then((v: string) => setAppVersion(v))
+  }, [])
+
+  // Live active-window feed from engine
+  useEffect(() => {
+    const handler = (_: any, title: string) => setCurrentApp(title || '—')
+    window.electron.ipcRenderer.on('active-window-update', handler)
+    return () => { window.electron.ipcRenderer.removeListener('active-window-update', handler) }
+  }, [])
+
+  // Reset per-session counters whenever a new tracking period starts
+  useEffect(() => {
+    if (isActive) {
+      setIdleSeconds(0)
+      setActiveSeconds(0)
+    }
+  }, [isActive])
 
   const handleToggleStartup = (val: boolean) => {
     setLaunchAtStartup(val)
@@ -64,6 +85,7 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
   const timerRef = useRef<NodeJS.Timeout | null>(null)
   const promptFiredRef = useRef<boolean>(false)
   const wasAutoStoppedRef = useRef<boolean>(false)
+  const autoStopTimeRef = useRef<number | null>(null)
   const activityWatchRef = useRef<NodeJS.Timeout | null>(null)
   const [autoClockInNotice, setAutoClockInNotice] = useState(false)
 
@@ -113,22 +135,35 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
         // @ts-ignore
         const engineStatus = await window.electron.ipcRenderer.invoke('get-engine-status')
 
-        if (engineStatus && engineStatus.isTracking) {
-          // Case 1: Engine is already running in background (window was just hidden)
-          // Resume timer from engine's stored start time
-          setIsActive(true)
-          if (engineStatus.startTime) {
-            const start = new Date(engineStatus.startTime).getTime()
-            const now = new Date().getTime()
-            setSessionSeconds(Math.floor((now - start) / 1000))
+        // Helper: seed session timer to match the web ClockControl formula exactly.
+        // Formula: completed sessions (today_total_hours) + net elapsed in current session.
+        // Net elapsed = gross elapsed since clock-in minus any break time already accumulated
+        // (today_break_hours covers completed breaks; ongoing break subtracted separately).
+        const seedSessionFromStatus = (s: typeof statusResp.data) => {
+          const completedSec = Math.round((s.today_total_hours || 0) * 3600)
+          const breakSec = Math.round((s.today_break_hours || 0) * 3600)
+          if (s.last_clock_in) {
+            const clockInStart = new Date(s.last_clock_in).getTime()
+            const grossSec = Math.max(0, Math.floor((Date.now() - clockInStart) / 1000))
+            // Subtract ongoing break duration if currently on break
+            const ongoingBreakSec = (s.is_on_break && s.last_break_start)
+              ? Math.max(0, Math.floor((Date.now() - new Date(s.last_break_start).getTime()) / 1000))
+              : 0
+            setSessionSeconds(completedSec + Math.max(0, grossSec - breakSec - ongoingBreakSec))
+          } else {
+            setSessionSeconds(completedSec)
           }
-        } else if (statusResp.data.is_clocked_in && statusResp.data.last_clock_in) {
-          // Case 2: Engine not running (e.g. after logout/login) but backend says
-          // user is still clocked in. Option B: auto-resume session from clock-in time.
+          const onBreak = !!s.is_on_break
+          setIsOnBreak(onBreak)
+          window.electron.ipcRenderer.send('set-break-state', onBreak)
+        }
+
+        if (engineStatus && engineStatus.isTracking) {
           setIsActive(true)
-          const start = new Date(statusResp.data.last_clock_in).getTime()
-          const now = new Date().getTime()
-          setSessionSeconds(Math.floor((now - start) / 1000))
+          seedSessionFromStatus(statusResp.data)
+        } else if (statusResp.data.is_clocked_in && statusResp.data.last_clock_in) {
+          setIsActive(true)
+          seedSessionFromStatus(statusResp.data)
         }
       } catch (e) {
         console.error('Failed to fetch user data', e)
@@ -175,31 +210,36 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
     if (isActive) {
       window.electron.ipcRenderer.send('start-tracking')
       timerRef.current = setInterval(async () => {
-        setSessionSeconds(s => s + 1)
-        
+        // Don't advance session timer while on break
+        setSessionSeconds(s => isOnBreak ? s : s + 1)
+
+        // Skip idle detection entirely while on break — user is intentionally away
+        if (isOnBreak) return
+
         try {
           // Fetch exact OS idle seconds directly via IPC
           const systemIdle: number = await window.electron.ipcRenderer.invoke('get-idle-time')
-          
+
           const IDLE_PROMPT_THRESHOLD = 180 // 3 minutes
           const AUTO_STOP_THRESHOLD = 300 // 5 minutes
-          
+
           if (systemIdle >= AUTO_STOP_THRESHOLD) {
              wasAutoStoppedRef.current = true
+             autoStopTimeRef.current = Date.now()
              setIsActive(false)
              setShowIdlePrompt(false)
              return
           }
-          
+
           const currentlyIdle = systemIdle >= IDLE_PROMPT_THRESHOLD
-          
+
           if (currentlyIdle && !promptFiredRef.current) {
             promptFiredRef.current = true
             window.electron.ipcRenderer.send('force-focus')
           } else if (!currentlyIdle) {
             promptFiredRef.current = false
           }
-          
+
           setShowIdlePrompt(currentlyIdle)
           setActiveSeconds(a => currentlyIdle ? a : a + 1)
           setIdleSeconds(i => currentlyIdle ? i + 1 : i)
@@ -219,7 +259,7 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
     return () => {
       if (timerRef.current) clearInterval(timerRef.current)
     }
-  }, [isActive])
+  }, [isActive, isOnBreak])
 
   // Activity watcher — only runs after an AUTO stop (not manual clock-out)
   // Polls every 5s; when user touches keyboard/mouse, auto-clocks back in
@@ -234,13 +274,29 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
         try {
           const idleTime: number = await window.electron.ipcRenderer.invoke('get-idle-time')
           if (idleTime < 30) {
+            autoStopTimeRef.current = null
             wasAutoStoppedRef.current = false
             clearInterval(activityWatchRef.current!)
             activityWatchRef.current = null
-            setSessionSeconds(0)
-            setIdleSeconds(0)
-            setActiveSeconds(0)
             setIsActive(true)
+            // After engine has had time to clock back in (~2.5s), re-sync timer
+            // from backend so it matches the web ClockControl exactly
+            setTimeout(async () => {
+              try {
+                const resp = await axios.get(`${apiUrl}/attendance/status`, { headers: authHeaders })
+                setDayStats(resp.data)
+                if (resp.data.is_clocked_in && resp.data.last_clock_in) {
+                  const completedSec = Math.round((resp.data.today_total_hours || 0) * 3600)
+                  const breakSec = Math.round((resp.data.today_break_hours || 0) * 3600)
+                  const start = new Date(resp.data.last_clock_in).getTime()
+                  const grossSec = Math.max(0, Math.floor((Date.now() - start) / 1000))
+                  const ongoingBreakSec = (resp.data.is_on_break && resp.data.last_break_start)
+                    ? Math.max(0, Math.floor((Date.now() - new Date(resp.data.last_break_start).getTime()) / 1000))
+                    : 0
+                  setSessionSeconds(completedSec + Math.max(0, grossSec - breakSec - ongoingBreakSec))
+                }
+              } catch (_) {}
+            }, 2500)
             setAutoClockInNotice(true)
             setTimeout(() => setAutoClockInNotice(false), 5000)
           }
@@ -256,26 +312,36 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
     }
   }, [isActive])
 
-  // Periodic stats refresh
+  // Periodic stats refresh — re-syncs session timer with backend every 60s
   useEffect(() => {
     if (!isActive) return
+    const headers = { Authorization: `Bearer ${token}` }
     const refresh = setInterval(async () => {
       try {
-        const resp = await axios.get(`${apiUrl}/attendance/status`, { headers: authHeaders })
+        const resp = await axios.get(`${apiUrl}/attendance/status`, { headers })
         setDayStats(resp.data)
-        
-        // Final sanity check: if backend says we are clocked out, stop tracking locally
         if (!resp.data.is_clocked_in) {
-           setIsActive(false)
+          setIsActive(false)
+          setIsOnBreak(false)
+        } else if (resp.data.last_clock_in) {
+          setIsOnBreak(!!resp.data.is_on_break)
+          const completedSec = Math.round((resp.data.today_total_hours || 0) * 3600)
+          const breakSec = Math.round((resp.data.today_break_hours || 0) * 3600)
+          const start = new Date(resp.data.last_clock_in).getTime()
+          const grossSec = Math.max(0, Math.floor((Date.now() - start) / 1000))
+          const ongoingBreakSec = (resp.data.is_on_break && resp.data.last_break_start)
+            ? Math.max(0, Math.floor((Date.now() - new Date(resp.data.last_break_start).getTime()) / 1000))
+            : 0
+          setSessionSeconds(completedSec + Math.max(0, grossSec - breakSec - ongoingBreakSec))
         }
       } catch (_) {}
     }, 60000)
     return () => clearInterval(refresh)
-  }, [isActive, apiUrl, authHeaders])
+  }, [isActive, apiUrl, token])
 
-  const totalDaySeconds = (dayStats?.today_total_hours || 0) * 3600
   const workGoalSeconds = 8 * 3600
-  const progressPct = Math.min(100, (totalDaySeconds / workGoalSeconds) * 100)
+  // Use live sessionSeconds for progress so the bar advances in real-time
+  const progressPct = Math.min(100, (sessionSeconds / workGoalSeconds) * 100)
   const sessionIdlePct = sessionSeconds > 0 ? Math.round((idleSeconds / sessionSeconds) * 100) : 0
   const sessionActivePct = 100 - sessionIdlePct
 
@@ -368,10 +434,6 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
                 </motion.button>
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '16px', alignItems: 'center', paddingBottom: '12px' }}>
-                 <div style={{ display: 'flex', alignItems: 'center', writingMode: 'vertical-rl', transform: 'rotate(180deg)', fontSize: '0.6rem', color: 'var(--wp-text-mute)', gap: '8px' }}>
-                    <input type="checkbox" checked={launchAtStartup} onChange={(e) => handleToggleStartup(e.target.checked)} />
-                    Autostart
-                 </div>
                  <button onClick={onLogout} style={{ background: 'none', border: 'none', color: 'var(--wp-danger)', cursor: 'pointer' }}>
                     <LogOut size={22} />
                  </button>
@@ -399,6 +461,12 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
                   <span style={{ width: '4px', height: '4px', borderRadius: '50%', background: 'currentColor' }} />
                   Connected
                </span>
+               {appVersion && (
+                 <>
+                   <span style={{ opacity: 0.3 }}>•</span>
+                   <span style={{ fontSize: '0.7rem', color: 'var(--wp-text-mute)', fontWeight: 600 }}>v{appVersion}</span>
+                 </>
+               )}
             </p>
           </motion.div>
 
@@ -462,30 +530,68 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
 
             <AnimatePresence>
               {isActive && (
-                <motion.div 
+                <motion.div
                   initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }}
-                  className="wp-badge" 
-                  style={{ backgroundColor: showIdlePrompt ? 'rgba(245,158,11,0.15)' : 'rgba(16, 185, 129, 0.15)', color: showIdlePrompt ? 'var(--wp-warning)' : 'var(--wp-success)' }}
+                  className="wp-badge"
+                  style={{
+                    backgroundColor: isOnBreak ? 'rgba(99,102,241,0.15)' : showIdlePrompt ? 'rgba(245,158,11,0.15)' : 'rgba(16, 185, 129, 0.15)',
+                    color: isOnBreak ? '#818cf8' : showIdlePrompt ? 'var(--wp-warning)' : 'var(--wp-success)'
+                  }}
                 >
-                  <span style={{ 
-                    width: '6px', height: '6px', borderRadius: '50%', 
-                    backgroundColor: 'currentColor', display: 'inline-block', 
-                    marginRight: '8px', boxShadow: '0 0 8px currentColor' 
+                  <span style={{
+                    width: '6px', height: '6px', borderRadius: '50%',
+                    backgroundColor: 'currentColor', display: 'inline-block',
+                    marginRight: '8px', boxShadow: '0 0 8px currentColor'
                   }} />
-                  {showIdlePrompt ? 'System Idle' : 'Tracking Active'}
+                  {isOnBreak ? 'On Break' : showIdlePrompt ? 'System Idle' : 'Tracking Active'}
                 </motion.div>
               )}
             </AnimatePresence>
 
-            <motion.button 
-              whileTap={{ scale: 0.95 }}
-              onClick={() => setIsActive(!isActive)}
-              className={`wp-button ${isActive ? 'wp-button-danger' : 'wp-button-primary'}`}
-              style={{ padding: '16px 48px', minWidth: '240px' }}
-            >
-              {isActive ? <Square size={20} fill="white" /> : <Play size={20} fill="white" />}
-              {isActive ? 'Clock Out Now' : 'Start Tracking'}
-            </motion.button>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center' }}>
+              <motion.button
+                whileTap={{ scale: 0.95 }}
+                onClick={() => setIsActive(!isActive)}
+                className={`wp-button ${isActive ? 'wp-button-danger' : 'wp-button-primary'}`}
+                style={{ padding: '16px 48px', minWidth: '240px' }}
+              >
+                {isActive ? <Square size={20} fill="white" /> : <Play size={20} fill="white" />}
+                {isActive ? 'Clock Out Now' : 'Start Tracking'}
+              </motion.button>
+
+              {isActive && (
+                <motion.button
+                  initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
+                  whileTap={{ scale: 0.95 }}
+                  onClick={async () => {
+                    try {
+                      if (isOnBreak) {
+                        await axios.post(`${apiUrl}/attendance/break-end`, {}, { headers: authHeaders })
+                        setIsOnBreak(false)
+                        window.electron.ipcRenderer.send('set-break-state', false)
+                      } else {
+                        await axios.post(`${apiUrl}/attendance/break-start`, {}, { headers: authHeaders })
+                        setIsOnBreak(true)
+                        window.electron.ipcRenderer.send('set-break-state', true)
+                      }
+                    } catch (e: any) {
+                      console.error('Break toggle failed', e)
+                    }
+                  }}
+                  style={{
+                    padding: '10px 32px', minWidth: '240px', borderRadius: '12px',
+                    background: isOnBreak ? 'rgba(16,185,129,0.15)' : 'rgba(99,102,241,0.15)',
+                    border: `1px solid ${isOnBreak ? 'var(--wp-success)' : 'rgba(99,102,241,0.4)'}`,
+                    color: isOnBreak ? 'var(--wp-success)' : '#818cf8',
+                    fontWeight: 700, fontSize: '0.85rem', cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
+                  }}
+                >
+                  <Coffee size={16} />
+                  {isOnBreak ? 'End Break' : 'Take a Break'}
+                </motion.button>
+              )}
+            </div>
           </motion.div>
 
           {/* Right Column - Goal & Session Metrics */}
@@ -502,7 +608,7 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
                   />
                </div>
                <p style={{ fontSize: '0.75rem', color: 'var(--wp-text-mute)', margin: 0 }}>
-                  {formatHours(dayStats?.today_total_hours || 0)} of 8h Goal
+                  {formatHours(sessionSeconds / 3600)} of 8h Goal
                </p>
             </div>
 
@@ -527,7 +633,7 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
         {/* Stats Grid */}
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '24px' }}>
           {[
-            { label: 'Today Total', val: formatHours(dayStats?.today_total_hours || 0), icon: Clock, color: '#3b82f6' },
+            { label: 'Today Total', val: formatHours(sessionSeconds / 3600), icon: Clock, color: '#3b82f6' },
             { label: 'Session Idle', val: formatDuration(idleSeconds), icon: Coffee, color: '#f59e0b' },
             { label: 'Session Active', val: formatDuration(activeSeconds), icon: Zap, color: '#10b981' },
             { label: 'Active App', val: currentApp, icon: Monitor, color: '#8b5cf6' }
