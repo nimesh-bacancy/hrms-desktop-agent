@@ -5,7 +5,7 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import log from 'electron-log'
 import icon from '../../resources/icon.png?asset'
 import { DesktopEngine } from './engine'
-import { initializeUpdater } from './updater'
+import { initializeUpdater, setFeedUrl, installUpdate } from './updater'
 
 // Initialize Tracking Engine early
 const engine = new DesktopEngine()
@@ -67,14 +67,14 @@ app.whenReady().then(() => {
   // Create Tray Icon
   tray = new Tray(icon)
   const contextMenu = Menu.buildFromTemplate([
-    { label: 'Open WorkPulse', click: () => mainWindow?.show() },
+    { label: 'Open WorkPulse HR', click: () => mainWindow?.show() },
     { type: 'separator' },
-    { label: 'Quit WorkPulse', click: async () => {
+    { label: 'Quit WorkPulse HR', click: async () => {
         if (engine.getStatus().isTracking) {
           const { response } = await dialog.showMessageBox({
             type: 'warning',
             title: 'Agent is still tracking',
-            message: 'Quitting will turn off the WorkPulse agent and stop monitoring.',
+            message: 'Quitting will turn off the WorkPulse HR agent and stop monitoring.',
             detail: 'Use "Stop Tracking" inside the app instead of quitting, so your session closes cleanly.\n\nIf you quit now your attendance session will stay open until the end-of-day auto-close.',
             buttons: ['Keep Agent Running', 'Stop Tracking & Quit'],
             defaultId: 0,
@@ -89,7 +89,7 @@ app.whenReady().then(() => {
       }
     }
   ])
-  tray.setToolTip('WorkPulse Desktop Agent')
+  tray.setToolTip('WorkPulse HR Desktop Agent')
   tray.setContextMenu(contextMenu)
   tray.on('click', () => {
     mainWindow?.show()
@@ -105,9 +105,54 @@ app.whenReady().then(() => {
     optimizer.watchWindowShortcuts(window)
   })
 
+  // Session expired — OS notification + bring window forward so user sees it
+  const showSessionExpiredNotification = () => {
+    if (Notification.isSupported()) {
+      const n = new Notification({
+        title: 'WorkPulse HR — Session Expired',
+        body: 'Your session has expired. Please log in again to continue tracking.',
+        urgency: 'critical',
+      })
+      n.on('click', () => {
+        mainWindow?.show()
+        mainWindow?.focus()
+      })
+      n.show()
+    }
+    // Restore window so the user can act on it
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    }
+  }
+
+  // Session expired — show OS notification and restore window
+  engine.onSessionExpired = showSessionExpiredNotification
+
+  // Notify renderer + show OS notification when a screenshot is taken
+  engine.onScreenshotTaken = () => {
+    const wins = BrowserWindow.getAllWindows()
+    wins.forEach(w => w.webContents.send('screenshot-taken'))
+    if (Notification.isSupported()) {
+      new Notification({
+        title: 'WorkPulse HR',
+        body: 'Screenshot captured by your administrator.',
+        silent: true,
+      }).show()
+    }
+  }
+
   // IPC handlers for Authentication & Tracking Control
-  ipcMain.on('save-auth', (_, { url, token }) => {
-    engine.setAuth(url, token)
+  ipcMain.on('save-auth', (_, { url, token, tenantId }) => {
+    engine.setAuth(url, token, tenantId ?? null)
+    // Wire updater feed URL now that we know where the backend lives
+    if (url) setFeedUrl(url)
+  })
+
+  // User clicked "Restart to Update" in the renderer
+  ipcMain.on('install-update', () => {
+    installUpdate()
   })
 
   ipcMain.on('logout', () => {
@@ -119,6 +164,11 @@ app.whenReady().then(() => {
 
   ipcMain.on('start-tracking', () => {
     engine.startTracking()
+  })
+
+  // Renderer reports accumulated mouse/keyboard activity count each pulse interval
+  ipcMain.on('report-activity', (_, { mouseMovement }: { mouseMovement: number }) => {
+    engine.setActivityCount(mouseMovement)
   })
 
   ipcMain.on('stop-tracking', () => {
@@ -163,7 +213,7 @@ app.whenReady().then(() => {
     // Fail-safe: Trigger an OS Notification so if the Linux window manager STILL blocks it, they get pinged
     if (Notification.isSupported()) {
       const notify = new Notification({
-        title: 'WorkPulse: Are you still working?',
+        title: 'WorkPulse HR: Are you still working?',
         body: 'You have been idle. Please return or time tracking will be automatically paused.',
         urgency: 'critical'
       })
@@ -209,10 +259,10 @@ app.whenReady().then(() => {
     return [
       '[Desktop Entry]',
       'Type=Application',
-      'Name=WorkPulse Agent',
+      'Name=WorkPulse HR Agent',
       `Exec="${execPath}" --autostart`,
       'Icon=workpulse-agent',
-      'Comment=WorkPulse Desktop Tracking Agent',
+      'Comment=WorkPulse HR Desktop Tracking Agent',
       'Categories=Utility;',
       'Terminal=false',
       'Hidden=false',

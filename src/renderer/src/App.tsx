@@ -39,7 +39,7 @@ const formatHours = (hours: number): string => {
 }
 
 // ─── Dashboard ────────────────────────────────────────────────────────────────
-const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: string; token: string }) => {
+const Dashboard = ({ onLogout, apiUrl, token, tenantId }: { onLogout: () => void; apiUrl: string; token: string; tenantId: number | null }) => {
   const [isActive, setIsActive] = useState(false)
   const [isOnBreak, setIsOnBreak] = useState(false)
   const [sessionSeconds, setSessionSeconds] = useState(0)
@@ -52,6 +52,15 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
   const [launchAtStartup, setLaunchAtStartup] = useState(false)
   const [appVersion, setAppVersion] = useState<string>('')
   const [isMini, setIsMini] = useState(false)
+  const [isReconnecting, setIsReconnecting] = useState(false)
+  const [updateAvailable, setUpdateAvailable] = useState<string | null>(null)   // version string
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null)     // 0-100
+  const [updateReady, setUpdateReady] = useState<string | null>(null)           // version string
+  const [updateBanner, setUpdateBanner] = useState<string | null>(null)
+  const [versionBlocked, setVersionBlocked] = useState<string | null>(null)    // minimum version required
+  const [clockOutError, setClockOutError] = useState<string | null>(null)
+  const [screenshotFlash, setScreenshotFlash] = useState(false)
+  const [sessionExpired, setSessionExpired] = useState(false)
 
   useEffect(() => {
     // @ts-ignore
@@ -59,7 +68,95 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
   }, [])
 
   useEffect(() => {
-    window.electron.ipcRenderer.invoke('get-app-version').then((v: string) => setAppVersion(v))
+    window.electron.ipcRenderer.invoke('get-app-version').then(async (v: string) => {
+      setAppVersion(v)
+      try {
+        const resp = await axios.get(`${apiUrl}/system/agent-release/latest`, { headers: authHeaders })
+        const data = resp.data
+
+        const toNum = (s: string) => s.replace(/[^0-9.]/g, '').split('.').map(Number)
+        const isOlderThan = (cur: string, ref: string) => {
+          const c = toNum(cur), r = toNum(ref)
+          for (let i = 0; i < Math.max(c.length, r.length); i++) {
+            if ((c[i] ?? 0) < (r[i] ?? 0)) return true
+            if ((c[i] ?? 0) > (r[i] ?? 0)) return false
+          }
+          return false
+        }
+
+        // Hard block: agent is below the minimum required version
+        const minVer: string = data?.minimum_version || '1.0.0'
+        if (isOlderThan(v, minVer)) {
+          setVersionBlocked(minVer)
+          return
+        }
+
+        // Soft banner: newer version available (only shown on Linux deb/snap where auto-update skips)
+        const osKey = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : 'linux'
+        const latest: string = data?.[osKey]?.version
+        if (latest && isOlderThan(v, latest)) {
+          setUpdateBanner(`Update available: v${latest} — download from the Downloads page`)
+        }
+      } catch (_) {
+        // Version check is non-critical — ignore errors
+      }
+    })
+  }, [])
+
+  // Clock-out failed notification from engine
+  useEffect(() => {
+    const handler = (_: any, msg: string) =>
+      setClockOutError(msg || 'Clock-out failed. Please clock out manually.')
+    window.electron?.ipcRenderer?.on('clock-out-failed', handler)
+    return () => { window.electron?.ipcRenderer?.removeListener('clock-out-failed', handler) }
+  }, [])
+
+  // Session expired — show banner then auto-logout after 5s
+  useEffect(() => {
+    const handler = () => {
+      setSessionExpired(true)
+      setTimeout(() => onLogout(), 5000)
+    }
+    window.electron?.ipcRenderer?.on('session-expired', handler)
+    return () => { window.electron?.ipcRenderer?.removeListener('session-expired', handler) }
+  }, [onLogout])
+
+  // Screenshot-taken notification
+  useEffect(() => {
+    const handler = () => {
+      setScreenshotFlash(true)
+      setTimeout(() => setScreenshotFlash(false), 3000)
+    }
+    window.electron?.ipcRenderer?.on('screenshot-taken', handler)
+    return () => { window.electron?.ipcRenderer?.removeListener('screenshot-taken', handler) }
+  }, [])
+
+  // Midnight rollover — engine started a new day session, reset UI counters to 0
+  // (new day = genuinely zero active/idle accumulated so far)
+  useEffect(() => {
+    const handler = () => {
+      setSessionSeconds(0)
+      setActiveSeconds(0)
+      setIdleSeconds(0)
+      setIsOnBreak(false)
+    }
+    window.electron?.ipcRenderer?.on('day-rolled-over', handler)
+    return () => { window.electron?.ipcRenderer?.removeListener('day-rolled-over', handler) }
+  }, [])
+
+  // Auto-update IPC listeners
+  useEffect(() => {
+    const onAvailable = (_: any, version: string) => { setUpdateAvailable(version); setUpdateProgress(0) }
+    const onProgress  = (_: any, pct: number)     => setUpdateProgress(pct)
+    const onReady     = (_: any, version: string) => { setUpdateReady(version); setUpdateProgress(null) }
+    window.electron?.ipcRenderer?.on('update-available',        onAvailable)
+    window.electron?.ipcRenderer?.on('update-download-progress', onProgress)
+    window.electron?.ipcRenderer?.on('update-downloaded',       onReady)
+    return () => {
+      window.electron?.ipcRenderer?.removeListener('update-available',         onAvailable)
+      window.electron?.ipcRenderer?.removeListener('update-download-progress', onProgress)
+      window.electron?.ipcRenderer?.removeListener('update-downloaded',        onReady)
+    }
   }, [])
 
   // Live active-window feed from engine
@@ -69,13 +166,25 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
     return () => { window.electron.ipcRenderer.removeListener('active-window-update', handler) }
   }, [])
 
-  // Reset per-session counters whenever a new tracking period starts
-  useEffect(() => {
-    if (isActive) {
-      setIdleSeconds(0)
-      setActiveSeconds(0)
+  // Seed idle/active counters from today's server-side productivity data.
+  // Call this whenever tracking starts/restarts so the widget always shows
+  // the FULL DAY totals, not just the time since the last app open.
+  const seedActivityCounters = async () => {
+    try {
+      const today = new Date().toISOString().slice(0, 10)
+      const resp = await axios.get(`${apiUrl}/activities/summary`, {
+        headers: authHeaders,
+        params: { start_date: today, end_date: today },
+      })
+      const rec = resp.data?.[0]
+      if (rec) {
+        setActiveSeconds(Math.round(rec.total_active_seconds || 0))
+        setIdleSeconds(Math.round(rec.total_idle_seconds || 0))
+      }
+    } catch (_) {
+      // Non-critical — counters will just accumulate from current value
     }
-  }, [isActive])
+  }
 
   const handleToggleStartup = (val: boolean) => {
     setLaunchAtStartup(val)
@@ -84,32 +193,93 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
   }
   const timerRef = useRef<NodeJS.Timeout | null>(null)
   const promptFiredRef = useRef<boolean>(false)
-  const wasAutoStoppedRef = useRef<boolean>(false)
-  const autoStopTimeRef = useRef<number | null>(null)
-  const activityWatchRef = useRef<NodeJS.Timeout | null>(null)
   const [autoClockInNotice, setAutoClockInNotice] = useState(false)
 
-  const authHeaders = { Authorization: `Bearer ${token}` }
+  // Mouse/keyboard activity tracking — sent to engine every 60s for intensity data
+  const mouseMovementRef = useRef<number>(0)
+  const activityFlushCountRef = useRef<number>(0)
+  useEffect(() => {
+    const onMouseMove = () => { mouseMovementRef.current += 1 }
+    const onKeyDown  = () => { mouseMovementRef.current += 2 } // keyboard weighted 2x
+    window.addEventListener('mousemove', onMouseMove)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('mousemove', onMouseMove)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [])
+
+  const authHeaders = {
+    Authorization: `Bearer ${token}`,
+    ...(tenantId ? { 'X-Tenant-ID': String(tenantId) } : {}),
+  }
 
   // Sync offline queue when coming back online
   useEffect(() => {
+    const handleOffline = () => {
+      console.log('App went offline, queuing pulses locally...')
+      setIsReconnecting(true)
+    }
     const handleOnline = () => {
       console.log('App back online, triggering sync...')
       window.electron.ipcRenderer.send('trigger-sync')
+      // Clear the banner once sync completes (give the engine ~3s to flush)
+      setTimeout(() => setIsReconnecting(false), 3000)
     }
+    window.addEventListener('offline', handleOffline)
     window.addEventListener('online', handleOnline)
-    return () => window.removeEventListener('online', handleOnline)
+    return () => {
+      window.removeEventListener('offline', handleOffline)
+      window.removeEventListener('online', handleOnline)
+    }
   }, [])
 
-  // Global Axios Interceptor for 401 Unauthorized (Token Expiry)
+  // Global Axios Interceptor — smart 401 handling
+  // Background tracking endpoints (pulse, attendance) → engine handles, no logout
+  // Identity endpoints (users/me) → token genuinely expired → logout
   useEffect(() => {
+    // Track consecutive 401s on identity calls to avoid false-positives from glitches
+    let consecutiveIdentity401s = 0
+
+    const BACKGROUND_ENDPOINTS = [
+      '/activities/desktop-pulse',
+      '/activities/agent-config',
+      '/activities/screenshot-upload-url',
+      '/attendance/status',
+      '/attendance/heartbeat',
+      '/attendance/clock-in',
+      '/attendance/clock-out',
+      '/system/',
+    ]
+
     const interceptor = axios.interceptors.response.use(
-      (response) => response,
+      (response) => {
+        consecutiveIdentity401s = 0 // reset on any success
+        return response
+      },
       (error) => {
-        if (error.response?.status === 401) {
-          console.warn('Token expired or invalid. Logging out.')
-          onLogout()
+        const url: string = error.config?.url || ''
+        const status: number = error.response?.status
+
+        if (status === 401) {
+          const isBackground = BACKGROUND_ENDPOINTS.some(ep => url.includes(ep))
+
+          if (isBackground) {
+            // Engine handles these — do not logout
+            return Promise.reject(error)
+          }
+
+          // Identity call (users/me, etc.) — token genuinely expired
+          // Require 2 consecutive failures to avoid glitch-logout
+          consecutiveIdentity401s++
+          if (consecutiveIdentity401s >= 2) {
+            console.warn('Token expired (confirmed). Logging out.')
+            consecutiveIdentity401s = 0
+            setSessionExpired(true)
+            setTimeout(() => onLogout(), 5000)
+          }
         }
+
         return Promise.reject(error)
       }
     )
@@ -161,9 +331,11 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
         if (engineStatus && engineStatus.isTracking) {
           setIsActive(true)
           seedSessionFromStatus(statusResp.data)
+          seedActivityCounters()
         } else if (statusResp.data.is_clocked_in && statusResp.data.last_clock_in) {
           setIsActive(true)
           seedSessionFromStatus(statusResp.data)
+          seedActivityCounters()
         }
       } catch (e) {
         console.error('Failed to fetch user data', e)
@@ -213,6 +385,16 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
         // Don't advance session timer while on break
         setSessionSeconds(s => isOnBreak ? s : s + 1)
 
+        // Every 60s: flush accumulated mouse/keyboard activity count to engine
+        // Uses a counter mod 60 so we stay aligned with the engine's 60s pulse
+        activityFlushCountRef.current = (activityFlushCountRef.current ?? 0) + 1
+        if (!isOnBreak && activityFlushCountRef.current >= 60) {
+          activityFlushCountRef.current = 0
+          const count = mouseMovementRef.current
+          mouseMovementRef.current = 0
+          window.electron.ipcRenderer.send('report-activity', { mouseMovement: count })
+        }
+
         // Skip idle detection entirely while on break — user is intentionally away
         if (isOnBreak) return
 
@@ -221,15 +403,6 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
           const systemIdle: number = await window.electron.ipcRenderer.invoke('get-idle-time')
 
           const IDLE_PROMPT_THRESHOLD = 180 // 3 minutes
-          const AUTO_STOP_THRESHOLD = 300 // 5 minutes
-
-          if (systemIdle >= AUTO_STOP_THRESHOLD) {
-             wasAutoStoppedRef.current = true
-             autoStopTimeRef.current = Date.now()
-             setIsActive(false)
-             setShowIdlePrompt(false)
-             return
-          }
 
           const currentlyIdle = systemIdle >= IDLE_PROMPT_THRESHOLD
 
@@ -261,61 +434,11 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
     }
   }, [isActive, isOnBreak])
 
-  // Activity watcher — only runs after an AUTO stop (not manual clock-out)
-  // Polls every 5s; when user touches keyboard/mouse, auto-clocks back in
-  useEffect(() => {
-    if (activityWatchRef.current) {
-      clearInterval(activityWatchRef.current)
-      activityWatchRef.current = null
-    }
 
-    if (!isActive && wasAutoStoppedRef.current) {
-      activityWatchRef.current = setInterval(async () => {
-        try {
-          const idleTime: number = await window.electron.ipcRenderer.invoke('get-idle-time')
-          if (idleTime < 30) {
-            autoStopTimeRef.current = null
-            wasAutoStoppedRef.current = false
-            clearInterval(activityWatchRef.current!)
-            activityWatchRef.current = null
-            setIsActive(true)
-            // After engine has had time to clock back in (~2.5s), re-sync timer
-            // from backend so it matches the web ClockControl exactly
-            setTimeout(async () => {
-              try {
-                const resp = await axios.get(`${apiUrl}/attendance/status`, { headers: authHeaders })
-                setDayStats(resp.data)
-                if (resp.data.is_clocked_in && resp.data.last_clock_in) {
-                  const completedSec = Math.round((resp.data.today_total_hours || 0) * 3600)
-                  const breakSec = Math.round((resp.data.today_break_hours || 0) * 3600)
-                  const start = new Date(resp.data.last_clock_in).getTime()
-                  const grossSec = Math.max(0, Math.floor((Date.now() - start) / 1000))
-                  const ongoingBreakSec = (resp.data.is_on_break && resp.data.last_break_start)
-                    ? Math.max(0, Math.floor((Date.now() - new Date(resp.data.last_break_start).getTime()) / 1000))
-                    : 0
-                  setSessionSeconds(completedSec + Math.max(0, grossSec - breakSec - ongoingBreakSec))
-                }
-              } catch (_) {}
-            }, 2500)
-            setAutoClockInNotice(true)
-            setTimeout(() => setAutoClockInNotice(false), 5000)
-          }
-        } catch (_) {}
-      }, 5000)
-    }
-
-    return () => {
-      if (activityWatchRef.current) {
-        clearInterval(activityWatchRef.current)
-        activityWatchRef.current = null
-      }
-    }
-  }, [isActive])
-
-  // Periodic stats refresh — re-syncs session timer with backend every 60s
+  // Periodic stats refresh — re-syncs session timer and activity counters with backend every 60s
   useEffect(() => {
     if (!isActive) return
-    const headers = { Authorization: `Bearer ${token}` }
+    const headers = authHeaders
     const refresh = setInterval(async () => {
       try {
         const resp = await axios.get(`${apiUrl}/attendance/status`, { headers })
@@ -334,6 +457,8 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
             : 0
           setSessionSeconds(completedSec + Math.max(0, grossSec - breakSec - ongoingBreakSec))
         }
+        // Re-sync active/idle counters from DB every 60s so widget stays accurate
+        await seedActivityCounters()
       } catch (_) {}
     }, 60000)
     return () => clearInterval(refresh)
@@ -442,7 +567,209 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
 
             {/* Main Content */}
             <div style={{ flex: 1, position: 'relative', overflowY: 'auto', padding: '32px 40px' }}>
-        
+
+        {/* Hard-block: agent version too old — must update before using */}
+        <AnimatePresence>
+          {versionBlocked && (
+            <motion.div
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+              style={{
+                position: 'fixed', inset: 0, zIndex: 9999,
+                background: 'rgba(3,5,10,0.92)', backdropFilter: 'blur(12px)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}
+            >
+              <motion.div
+                initial={{ scale: 0.9, y: 20 }} animate={{ scale: 1, y: 0 }}
+                className="glass-card"
+                style={{ padding: '48px', maxWidth: '420px', textAlign: 'center' }}
+              >
+                <div style={{ fontSize: '3rem', marginBottom: '16px' }}>⚠️</div>
+                <h2 style={{ fontSize: '1.4rem', fontWeight: 800, marginBottom: '12px', color: 'var(--wp-danger)' }}>
+                  Update Required
+                </h2>
+                <p style={{ color: 'var(--wp-text-mute)', fontSize: '0.9rem', lineHeight: 1.6, marginBottom: '8px' }}>
+                  This version of WorkPulse HR is no longer supported.
+                </p>
+                <p style={{ color: 'var(--wp-text-mute)', fontSize: '0.9rem', marginBottom: '32px' }}>
+                  Minimum required version: <strong style={{ color: '#fff' }}>v{versionBlocked}</strong>
+                </p>
+                <p style={{ color: 'var(--wp-text-mute)', fontSize: '0.8rem' }}>
+                  Please download the latest version from your admin's Downloads page and reinstall.
+                </p>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Reconnecting Banner */}
+        <AnimatePresence>
+          {isReconnecting && (
+            <motion.div
+              initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}
+              style={{
+                position: 'sticky', top: 0, zIndex: 50, marginBottom: '16px',
+                background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.4)',
+                borderRadius: '10px', padding: '10px 16px',
+                display: 'flex', alignItems: 'center', gap: '10px', backdropFilter: 'blur(8px)',
+              }}
+            >
+              <span style={{ fontSize: '1rem' }}>&#x26A1;</span>
+              <span style={{ color: 'var(--wp-warning)', fontWeight: 600, fontSize: '0.85rem' }}>
+                Offline — pulses queued locally, will sync when reconnected
+              </span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Update Ready — "Restart to Install" (highest priority) */}
+        <AnimatePresence>
+          {updateReady && (
+            <motion.div
+              initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}
+              style={{
+                position: 'sticky', top: 0, zIndex: 50, marginBottom: '16px',
+                background: 'rgba(16, 185, 129, 0.12)', border: '1px solid rgba(16,185,129,0.5)',
+                borderRadius: '10px', padding: '10px 16px',
+                display: 'flex', alignItems: 'center', gap: '12px', backdropFilter: 'blur(8px)',
+              }}
+            >
+              <span style={{ fontSize: '1rem' }}>🚀</span>
+              <span style={{ color: 'var(--wp-success)', fontWeight: 600, fontSize: '0.85rem', flex: 1 }}>
+                v{updateReady} is ready — restart to install the update.
+              </span>
+              <button
+                onClick={() => window.electron.ipcRenderer.send('install-update')}
+                style={{
+                  padding: '6px 16px', borderRadius: '8px', border: 'none', cursor: 'pointer',
+                  background: 'var(--wp-success)', color: '#fff', fontWeight: 700, fontSize: '0.8rem',
+                }}
+              >
+                Restart Now
+              </button>
+              <button
+                onClick={() => setUpdateReady(null)}
+                style={{ background: 'none', border: 'none', color: 'var(--wp-text-mute)', cursor: 'pointer', fontSize: '1rem' }}
+              >
+                &#x2715;
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Update Downloading — progress bar */}
+        <AnimatePresence>
+          {updateAvailable && updateProgress !== null && !updateReady && (
+            <motion.div
+              initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}
+              style={{
+                position: 'sticky', top: 0, zIndex: 50, marginBottom: '16px',
+                background: 'rgba(245, 158, 11, 0.10)', border: '1px solid rgba(245,158,11,0.4)',
+                borderRadius: '10px', padding: '10px 16px', backdropFilter: 'blur(8px)',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
+                <span style={{ fontSize: '1rem' }}>⬇️</span>
+                <span style={{ color: 'var(--wp-warning)', fontWeight: 600, fontSize: '0.85rem', flex: 1 }}>
+                  Downloading v{updateAvailable}… {updateProgress}%
+                </span>
+              </div>
+              <div style={{ width: '100%', height: '4px', background: 'rgba(255,255,255,0.08)', borderRadius: '2px' }}>
+                <motion.div
+                  animate={{ width: `${updateProgress}%` }}
+                  style={{ height: '100%', background: 'var(--wp-warning)', borderRadius: '2px' }}
+                />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Fallback: manual download banner (shown when updater not supported, e.g. Linux deb) */}
+        <AnimatePresence>
+          {updateBanner && !updateAvailable && !updateReady && (
+            <motion.div
+              initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}
+              style={{
+                position: 'sticky', top: 0, zIndex: 50, marginBottom: '16px',
+                background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.4)',
+                borderRadius: '10px', padding: '10px 16px',
+                display: 'flex', alignItems: 'center', gap: '10px', backdropFilter: 'blur(8px)',
+              }}
+            >
+              <span style={{ color: 'var(--wp-warning)', fontWeight: 600, fontSize: '0.85rem', flex: 1 }}>
+                {updateBanner}
+              </span>
+              <button
+                onClick={() => setUpdateBanner(null)}
+                style={{ background: 'none', border: 'none', color: 'var(--wp-text-mute)', cursor: 'pointer', fontSize: '1rem' }}
+              >
+                &#x2715;
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Clock-Out Failed Error Banner */}
+        <AnimatePresence>
+          {sessionExpired && (
+            <motion.div
+              key="session-expired"
+              initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}
+              style={{
+                position: 'sticky', top: 0, zIndex: 50, marginBottom: '16px',
+                background: 'rgba(239, 68, 68, 0.18)', border: '1px solid rgba(239, 68, 68, 0.6)',
+                borderRadius: '10px', padding: '10px 16px',
+                display: 'flex', alignItems: 'center', gap: '10px', backdropFilter: 'blur(8px)',
+              }}
+            >
+              <span style={{ fontSize: '1rem' }}>⚠️</span>
+              <span style={{ color: '#ef4444', fontWeight: 700, fontSize: '0.85rem', flex: 1 }}>
+                Your session has expired. Redirecting to login in 5 seconds...
+              </span>
+            </motion.div>
+          )}
+
+          {clockOutError && (
+            <motion.div
+              initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}
+              style={{
+                position: 'sticky', top: 0, zIndex: 50, marginBottom: '16px',
+                background: 'rgba(239, 68, 68, 0.12)', border: '1px solid rgba(239, 68, 68, 0.4)',
+                borderRadius: '10px', padding: '10px 16px',
+                display: 'flex', alignItems: 'center', gap: '10px', backdropFilter: 'blur(8px)',
+              }}
+            >
+              <span style={{ color: 'var(--wp-danger)', fontWeight: 600, fontSize: '0.85rem', flex: 1 }}>
+                {clockOutError}
+              </span>
+              <button
+                onClick={() => setClockOutError(null)}
+                style={{ background: 'none', border: 'none', color: 'var(--wp-text-mute)', cursor: 'pointer', fontSize: '1rem', lineHeight: 1 }}
+              >
+                &#x2715;
+              </button>
+            </motion.div>
+          )}
+
+          {screenshotFlash && (
+            <motion.div
+              key="screenshot-flash"
+              initial={{ opacity: 0, y: -12 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -12 }}
+              style={{
+                position: 'sticky', top: 0, zIndex: 50, marginBottom: '16px',
+                background: 'rgba(99, 102, 241, 0.12)', border: '1px solid rgba(99, 102, 241, 0.4)',
+                borderRadius: '10px', padding: '10px 16px',
+                display: 'flex', alignItems: 'center', gap: '10px', backdropFilter: 'blur(8px)',
+              }}
+            >
+              <span style={{ fontSize: '1rem' }}>📸</span>
+              <span style={{ color: 'var(--wp-accent)', fontWeight: 600, fontSize: '0.85rem', flex: 1 }}>
+                Screenshot captured by your administrator.
+              </span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Header Area */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '40px' }}>
           <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}>
@@ -613,18 +940,25 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
             </div>
 
             <div className="glass-card" style={{ padding: '24px', flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
-               <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
+               <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
                   <div style={{ width: '40px', height: '40px', borderRadius: '10px', background: 'rgba(59, 130, 246, 0.1)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                      <Zap size={20} color="var(--wp-accent)" />
                   </div>
                   <div>
-                    <div style={{ fontSize: '0.75rem', color: 'var(--wp-text-mute)' }}>Session Split</div>
-                    <div style={{ fontSize: '0.9rem', fontWeight: 700 }}>{sessionActivePct}% Active</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--wp-text-mute)' }}>Productivity Score</div>
+                    <div style={{ fontSize: '1.1rem', fontWeight: 800, color: sessionActivePct >= 70 ? 'var(--wp-success)' : sessionActivePct >= 40 ? 'var(--wp-warning)' : 'var(--wp-danger)' }}>
+                      {sessionActivePct}%
+                    </div>
                   </div>
                </div>
-               <div style={{ display: 'flex', height: '6px', gap: '4px' }}>
-                  <div style={{ flex: sessionActivePct, background: 'var(--wp-success)', borderRadius: '3px' }} />
-                  <div style={{ flex: sessionIdlePct, background: 'var(--wp-warning)', borderRadius: '3px' }} />
+               {/* Active vs Idle bar */}
+               <div style={{ display: 'flex', height: '6px', gap: '2px', borderRadius: '4px', overflow: 'hidden' }}>
+                  <div style={{ flex: sessionActivePct, background: 'var(--wp-success)', transition: 'flex 1s' }} />
+                  <div style={{ flex: sessionIdlePct, background: 'rgba(245,158,11,0.4)', transition: 'flex 1s' }} />
+               </div>
+               <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '6px', fontSize: '0.7rem', color: 'var(--wp-text-mute)' }}>
+                  <span>🟢 {sessionActivePct}% active</span>
+                  <span>🟡 {sessionIdlePct}% idle</span>
                </div>
             </div>
           </div>
@@ -714,39 +1048,45 @@ const Dashboard = ({ onLogout, apiUrl, token }: { onLogout: () => void; apiUrl: 
 const App = () => {
   const [authToken, setAuthToken] = useState<string | null>(() => localStorage.getItem('wp_token'))
   const [apiUrl, setApiUrl] = useState<string>(() => localStorage.getItem('wp_api_url') || '')
+  const [tenantId, setTenantId] = useState<number | null>(() => {
+    const t = localStorage.getItem('wp_tenant_id')
+    return t ? parseInt(t) : null
+  })
 
-  // CRITICAL: Re-initialize the main process engine with stored credentials on every startup.
-  // The renderer reads the token from localStorage for its own state, but the main process
-  // engine is a separate Node.js process that loses its in-memory auth on every app quit.
-  // Without this, engine.startTracking() silently returns because engine.token is empty.
+  // Re-initialize engine with stored credentials on every startup
   useEffect(() => {
     if (authToken && apiUrl) {
+      const tid = localStorage.getItem('wp_tenant_id')
       console.log('[App] Restoring engine auth from localStorage on startup.')
-      window.electron.ipcRenderer.send('save-auth', { url: apiUrl, token: authToken })
+      window.electron.ipcRenderer.send('save-auth', { url: apiUrl, token: authToken, tenantId: tid ? parseInt(tid) : null })
     }
-  }, []) // Run once on mount only
+  }, [])
 
-  const handleLoginSuccess = (url: string, token: string) => {
-    window.electron.ipcRenderer.send('save-auth', { url, token })
+  const handleLoginSuccess = (url: string, token: string, tid: number) => {
+    window.electron.ipcRenderer.send('save-auth', { url, token, tenantId: tid })
     localStorage.setItem('wp_api_url', url)
     localStorage.setItem('wp_token', token)
+    localStorage.setItem('wp_tenant_id', String(tid))
     setApiUrl(url)
     setAuthToken(token)
+    setTenantId(tid)
   }
 
   const handleLogout = () => {
     window.electron.ipcRenderer.send('logout')
     localStorage.removeItem('wp_token')
     localStorage.removeItem('wp_api_url')
+    localStorage.removeItem('wp_tenant_id')
     setAuthToken(null)
     setApiUrl('')
+    setTenantId(null)
   }
 
   if (!authToken) {
     return <Login onLoginSuccess={handleLoginSuccess} />
   }
 
-  return <Dashboard onLogout={handleLogout} apiUrl={apiUrl} token={authToken} />
+  return <Dashboard onLogout={handleLogout} apiUrl={apiUrl} token={authToken} tenantId={tenantId} />
 }
 
 export default App
