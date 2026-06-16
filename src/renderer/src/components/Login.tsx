@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 
 const DEFAULT_API_URL = 'https://api.projectsoftware.com/api/v1'
 
-const Login = ({ onLoginSuccess }: { onLoginSuccess: (url: string, token: string, tenantId: number) => void }) => {
+const Login = ({ onLoginSuccess }: { onLoginSuccess: (url: string, token: string, tenantId: number, refreshToken?: string) => void }) => {
   const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL)
   const [subdomain, setSubdomain] = useState('')
   const [tenantId, setTenantId] = useState<number | null>(null)
@@ -80,7 +80,7 @@ const Login = ({ onLoginSuccess }: { onLoginSuccess: (url: string, token: string
         })
         const mfaData = await mfaRes.json()
         if (mfaRes.ok && mfaData.access_token) {
-          onLoginSuccess(apiUrl, mfaData.access_token, tenantId)
+          onLoginSuccess(apiUrl, mfaData.access_token, tenantId, mfaData.refresh_token)
           return
         }
         setError(mfaData.detail || 'Invalid 2FA code. Please try again.')
@@ -117,7 +117,7 @@ const Login = ({ onLoginSuccess }: { onLoginSuccess: (url: string, token: string
       }
 
       if (data.access_token) {
-        onLoginSuccess(apiUrl, data.access_token, tenantId)
+        onLoginSuccess(apiUrl, data.access_token, tenantId, data.refresh_token)
       } else {
         setError('Unexpected server response. Please try again.')
       }

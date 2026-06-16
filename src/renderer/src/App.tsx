@@ -1057,16 +1057,29 @@ const App = () => {
   useEffect(() => {
     if (authToken && apiUrl) {
       const tid = localStorage.getItem('wp_tenant_id')
+      const rt = localStorage.getItem('wp_refresh_token')
       console.log('[App] Restoring engine auth from localStorage on startup.')
-      window.electron.ipcRenderer.send('save-auth', { url: apiUrl, token: authToken, tenantId: tid ? parseInt(tid) : null })
+      window.electron.ipcRenderer.send('save-auth', { url: apiUrl, token: authToken, tenantId: tid ? parseInt(tid) : null, refreshToken: rt })
     }
   }, [])
 
-  const handleLoginSuccess = (url: string, token: string, tid: number) => {
-    window.electron.ipcRenderer.send('save-auth', { url, token, tenantId: tid })
+  // Keep localStorage in sync when engine silently refreshes the access token
+  useEffect(() => {
+    const handler = (_: unknown, { accessToken, refreshToken }: { accessToken: string; refreshToken?: string }) => {
+      localStorage.setItem('wp_token', accessToken)
+      setAuthToken(accessToken)
+      if (refreshToken) localStorage.setItem('wp_refresh_token', refreshToken)
+    }
+    window.electron?.ipcRenderer?.on('token-refreshed', handler)
+    return () => { window.electron?.ipcRenderer?.removeListener('token-refreshed', handler) }
+  }, [])
+
+  const handleLoginSuccess = (url: string, token: string, tid: number, refreshToken?: string) => {
+    window.electron.ipcRenderer.send('save-auth', { url, token, tenantId: tid, refreshToken })
     localStorage.setItem('wp_api_url', url)
     localStorage.setItem('wp_token', token)
     localStorage.setItem('wp_tenant_id', String(tid))
+    if (refreshToken) localStorage.setItem('wp_refresh_token', refreshToken)
     setApiUrl(url)
     setAuthToken(token)
     setTenantId(tid)

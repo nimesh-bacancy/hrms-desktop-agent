@@ -144,10 +144,16 @@ app.whenReady().then(() => {
   }
 
   // IPC handlers for Authentication & Tracking Control
-  ipcMain.on('save-auth', (_, { url, token, tenantId }) => {
+  ipcMain.on('save-auth', (_, { url, token, tenantId, refreshToken }) => {
     engine.setAuth(url, token, tenantId ?? null)
+    if (refreshToken) engine.setRefreshToken(refreshToken)
     // Wire updater feed URL now that we know where the backend lives
     if (url) setFeedUrl(url)
+  })
+
+  // Renderer requests a token refresh (called when engine gets 401)
+  ipcMain.handle('refresh-token', async () => {
+    return await engine.refreshAccessToken()
   })
 
   // User clicked "Restart to Update" in the renderer
@@ -159,6 +165,7 @@ app.whenReady().then(() => {
     // Option B: Don't stop tracking — just disconnect locally.
     // The attendance session keeps running on the server and will
     // resume correctly when the user logs back in.
+    engine.revokeRefreshToken()
     engine.setAuth('', '')
   })
 
@@ -255,7 +262,9 @@ app.whenReady().then(() => {
   }
 
   const getLinuxDesktopContent = () => {
-    const execPath = process.execPath
+    // app.getPath('exe') returns the AppImage path in production; process.execPath
+    // returns the inner electron binary (wrong). Always prefer exe path.
+    const execPath = app.getPath('exe')
     return [
       '[Desktop Entry]',
       'Type=Application',
@@ -281,6 +290,12 @@ app.whenReady().then(() => {
 
   ipcMain.on('set-launch-at-startup', async (_, openAtLogin: boolean) => {
     if (process.platform === 'linux') {
+      // Only write autostart in production — in dev, process.execPath / app.getPath('exe')
+      // both point to the raw electron binary which opens Electron boilerplate, not the app.
+      if (!app.isPackaged) {
+        log.info('Autostart skipped: not a packaged build (dev mode).')
+        return
+      }
       try {
         const autostartPath = getLinuxAutostartPath()
         const configDir = join(app.getPath('home'), '.config', 'autostart')
@@ -306,6 +321,7 @@ app.whenReady().then(() => {
 
   ipcMain.handle('get-launch-at-startup', async () => {
     if (process.platform === 'linux') {
+      if (!app.isPackaged) return false // dev mode: treat as disabled
       return await getLinuxAutostartStatus()
     }
     const settings = app.getLoginItemSettings()

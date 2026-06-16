@@ -57,7 +57,9 @@ export class DesktopEngine {
   // ── Auth ────────────────────────────────────────────────────────────────────
   private apiUrl = ''
   private token = ''
+  private refreshToken = ''
   private tenantId: number | null = null
+  private isRefreshingToken = false
 
   // ── Config from server ──────────────────────────────────────────────────────
   private agentConfig: AgentConfig = { ...DEFAULT_CONFIG }
@@ -117,6 +119,48 @@ export class DesktopEngine {
   }
 
   // ── Auth / init ─────────────────────────────────────────────────────────────
+  public setRefreshToken(refreshToken: string) {
+    this.refreshToken = refreshToken
+  }
+
+  /** Exchange refresh token for a new access token. Returns new access token or null on failure. */
+  public async refreshAccessToken(): Promise<string | null> {
+    if (!this.refreshToken || !this.apiUrl) return null
+    if (this.isRefreshingToken) return null
+    this.isRefreshingToken = true
+    try {
+      const { data } = await axios.post(`${this.apiUrl}/auth/refresh`, {
+        refresh_token: this.refreshToken,
+      }, { timeout: 10_000 })
+      if (data?.access_token) {
+        this.token = data.access_token
+        if (data.refresh_token) this.refreshToken = data.refresh_token
+        this.L(`Token refreshed successfully.`)
+        // Notify renderer so it can update localStorage
+        BrowserWindow.getAllWindows().forEach(w =>
+          w.webContents.send('token-refreshed', { accessToken: data.access_token, refreshToken: data.refresh_token })
+        )
+        return data.access_token
+      }
+      return null
+    } catch (e) {
+      this.L(`Token refresh failed: ${getErrorMessage(e)}`)
+      return null
+    } finally {
+      this.isRefreshingToken = false
+    }
+  }
+
+  /** Revoke refresh token on logout (best-effort). */
+  public revokeRefreshToken() {
+    if (!this.refreshToken || !this.apiUrl) return
+    const rt = this.refreshToken
+    this.refreshToken = ''
+    axios.post(`${this.apiUrl}/auth/logout`, { refresh_token: rt }, {
+      headers: this.headers, timeout: 5000,
+    }).catch(() => {})
+  }
+
   public setAuth(apiUrl: string, token: string, tenantId?: number | null) {
     if (tenantId !== undefined) this.tenantId = tenantId ?? null
 
@@ -625,6 +669,24 @@ export class DesktopEngine {
     } catch (e: any) {
       const status = e?.response?.status
       if ([401, 403].includes(status)) {
+        // Try to refresh the access token before giving up
+        if (status === 401 && this.refreshToken) {
+          this.L(`Access token expired (401) — attempting refresh...`)
+          const newToken = await this.refreshAccessToken()
+          if (newToken) {
+            // Retry the pulse once with the new token
+            try {
+              await axios.post(`${this.apiUrl}/activities/desktop-pulse`, body, {
+                headers: this.headers, timeout: 10_000,
+              })
+              this.L('Pulse sent after token refresh.')
+              await this.syncOfflineQueue()
+              return
+            } catch (retryErr: any) {
+              this.L(`Pulse retry after refresh failed: ${getErrorMessage(retryErr)}`)
+            }
+          }
+        }
         this.L(`Session expired (${status}) — force stopping.`)
         this.forceStop()
         this.onSessionExpired?.()
