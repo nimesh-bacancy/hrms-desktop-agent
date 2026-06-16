@@ -56,4 +56,4 @@ appImage:
   artifactName: ${name}-${version}.${ext}
 publish:
   provider: generic
-  url: https://api.projectsoftware.com/api/v1/system/agent-release/
+  url: https://api.projectsoftware.com/api/v1/system/agent-release

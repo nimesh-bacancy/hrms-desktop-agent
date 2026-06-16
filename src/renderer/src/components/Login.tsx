@@ -244,7 +244,7 @@ const Login = ({ onLoginSuccess }: { onLoginSuccess: (url: string, token: string
                 <CheckCircle size={16} style={{ color: '#6366f1', flexShrink: 0 }} />
                 <div>
                   <div style={{ fontSize: '12px', fontWeight: 700, color: '#a5b4fc' }}>{tenantName}</div>
-                  <div style={{ fontSize: '10px', color: 'var(--wp-text-mute)' }}>{subdomain}.app.projectsoftware.com</div>
+                  <div style={{ fontSize: '10px', color: 'var(--wp-text-mute)' }}>{subdomain}.projectsoftware.com</div>
                 </div>
                 <button type="button" onClick={() => { setStep('org'); setError(''); setTenantId(null) }}
                   style={{ marginLeft: 'auto', background: 'none', border: 'none', color: 'var(--wp-text-mute)', cursor: 'pointer', fontSize: '11px' }}>
