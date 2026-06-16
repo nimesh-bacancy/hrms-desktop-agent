@@ -193,7 +193,7 @@ const Dashboard = ({ onLogout, apiUrl, token, tenantId }: { onLogout: () => void
   }
   const timerRef = useRef<NodeJS.Timeout | null>(null)
   const promptFiredRef = useRef<boolean>(false)
-  const [autoClockInNotice, setAutoClockInNotice] = useState(false)
+  const [autoClockInNotice, _setAutoClockInNotice] = useState(false)
 
   // Mouse/keyboard activity tracking — sent to engine every 60s for intensity data
   const mouseMovementRef = useRef<number>(0)

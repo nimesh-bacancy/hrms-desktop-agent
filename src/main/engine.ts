@@ -10,7 +10,7 @@
  *  6. Agent config is fetched from server (screenshot_enabled, interval)
  */
 
-import { app, powerMonitor, desktopCapturer, BrowserWindow, systemPreferences, ipcMain } from 'electron'
+import { app, powerMonitor, desktopCapturer, BrowserWindow, systemPreferences } from 'electron'
 import { join } from 'path'
 import { promises as fs } from 'fs'
 import axios from 'axios'
@@ -309,7 +309,6 @@ export class DesktopEngine {
     // Best-effort: clear is_agent_active on the server so the UI shows disconnected.
     // Ignore errors — the session may already be dead (401) or closed.
     if (this.attendanceId && this.token) {
-      const aid = this.attendanceId
       this.attendanceId = null
       axios.post(`${this.apiUrl}/attendance/clock-out`, {}, {
         headers: this.headers, timeout: 5000,
