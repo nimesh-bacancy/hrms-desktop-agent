@@ -1,6 +1,6 @@
 {
   "name": "workpulse-agent",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "packageManager": "npm@10.9.2",
   "description": "An Electron application with React and TypeScript",
   "main": "./out/main/index.js",
