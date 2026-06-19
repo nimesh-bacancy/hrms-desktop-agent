@@ -61,6 +61,10 @@ export class DesktopEngine {
   private tenantId: number | null = null
   private isRefreshingToken = false
 
+  // ── HTTP client (interceptor-equipped) ───────────────────────────────────────
+  private http!: ReturnType<typeof axios.create>
+  private _refreshPromise: Promise<string | null> | null = null
+
   // ── Config from server ──────────────────────────────────────────────────────
   private agentConfig: AgentConfig = { ...DEFAULT_CONFIG }
 
@@ -80,6 +84,7 @@ export class DesktopEngine {
 
   constructor() {
     this.queueFilePath = join(app.getPath('userData'), 'wp_queue.json')
+    this.setupHttpClient()
   }
 
   // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -90,6 +95,60 @@ export class DesktopEngine {
       Authorization: `Bearer ${this.token}`,
       ...(this.tenantId ? { 'X-Tenant-ID': String(this.tenantId) } : {}),
     }
+  }
+
+  private setupHttpClient() {
+    this.http = axios.create()
+
+    // Inject the latest token on every outgoing request
+    this.http.interceptors.request.use(config => {
+      config.headers['Authorization'] = `Bearer ${this.token}`
+      if (this.tenantId) config.headers['X-Tenant-ID'] = String(this.tenantId)
+      return config
+    })
+
+    // Central 401 handler: refresh once, retry, or signal session expiry
+    this.http.interceptors.response.use(
+      res => res,
+      async (error) => {
+        const orig = error.config
+        // Skip: not a 401, already retried, or the request is an auth endpoint itself
+        if (
+          error?.response?.status !== 401 ||
+          orig._retried ||
+          orig.url?.includes('/auth/refresh') ||
+          orig.url?.includes('/auth/logout')
+        ) {
+          return Promise.reject(error)
+        }
+        if (!this.refreshToken) {
+          this.L('401 — no refresh token. Session expired.')
+          this._onSessionExpired()
+          return Promise.reject(error)
+        }
+        orig._retried = true
+        // Share a single in-flight refresh so concurrent 401s don't race
+        if (!this._refreshPromise) {
+          this._refreshPromise = this.refreshAccessToken().finally(() => {
+            this._refreshPromise = null
+          })
+        }
+        const newToken = await this._refreshPromise
+        if (newToken) {
+          // Request interceptor will stamp the new token; just re-dispatch
+          return this.http(orig)
+        }
+        this.L('Token refresh failed — session expired.')
+        this._onSessionExpired()
+        return Promise.reject(error)
+      }
+    )
+  }
+
+  private _onSessionExpired() {
+    this.onSessionExpired?.()
+    if (this.isTracking) this.forceStop()
+    BrowserWindow.getAllWindows().forEach(w => w.webContents.send('session-expired'))
   }
 
   /** Pulse always runs every 60 seconds for accurate activity tracking */
@@ -228,7 +287,7 @@ export class DesktopEngine {
   private async sendPresenceHeartbeat() {
     if (!this.token || !this.apiUrl) return
     try {
-      await axios.post(`${this.apiUrl}/attendance/heartbeat`, {}, {
+      await this.http.post(`${this.apiUrl}/attendance/heartbeat`, {}, {
         headers: this.headers, timeout: 8000,
       })
     } catch {
@@ -239,7 +298,7 @@ export class DesktopEngine {
   // ── Agent config ─────────────────────────────────────────────────────────────
   private async fetchAndApplyAgentConfig() {
     try {
-      const { data } = await axios.get(`${this.apiUrl}/activities/agent-config`, {
+      const { data } = await this.http.get(`${this.apiUrl}/activities/agent-config`, {
         headers: this.headers, timeout: 8000,
       })
       if (!data) return
@@ -279,7 +338,7 @@ export class DesktopEngine {
   // ── Timezone ─────────────────────────────────────────────────────────────────
   private async fetchUserTimezone() {
     try {
-      const { data } = await axios.get(`${this.apiUrl}/users/me`, {
+      const { data } = await this.http.get(`${this.apiUrl}/users/me`, {
         headers: this.headers, timeout: 8000,
       })
       if (data?.timezone) {
@@ -354,7 +413,7 @@ export class DesktopEngine {
     // Ignore errors — the session may already be dead (401) or closed.
     if (this.attendanceId && this.token) {
       this.attendanceId = null
-      axios.post(`${this.apiUrl}/attendance/clock-out`, {}, {
+      this.http.post(`${this.apiUrl}/attendance/clock-out`, {}, {
         headers: this.headers, timeout: 5000,
       }).catch(() => {
         // Silently ignore — session was already dead (401/403) or network is gone
@@ -369,20 +428,18 @@ export class DesktopEngine {
   private async triggerClockIn(): Promise<boolean> {
     try {
       // Always check server state first — never double-clock-in
-      const { data: status } = await axios.get(`${this.apiUrl}/attendance/status`, {
+      const { data: status } = await this.http.get(`${this.apiUrl}/attendance/status`, {
         headers: this.headers, timeout: 8000,
       })
       if (status?.is_clocked_in && status?.attendance_id) {
         this.attendanceId = status.attendance_id
-        // Fix 8: Re-sync break state from server so a post-crash/re-auth agent
-        // doesn't send active pulses while the server thinks the user is on break.
         if (typeof status.is_on_break === 'boolean') {
           this.isOnBreak = status.is_on_break
         }
         this.L(`Already clocked in (id=${this.attendanceId}, onBreak=${this.isOnBreak}).`)
         return true
       }
-      const { data } = await axios.post(`${this.apiUrl}/attendance/clock-in`, {}, {
+      const { data } = await this.http.post(`${this.apiUrl}/attendance/clock-in`, {}, {
         headers: this.headers, timeout: 8000,
       })
       if (data?.id) {
@@ -391,7 +448,7 @@ export class DesktopEngine {
         return true
       }
       return false
-    } catch (e) {
+    } catch (e: any) {
       this.L(`Clock-in failed: ${getErrorMessage(e)}`)
       return false
     }
@@ -403,7 +460,7 @@ export class DesktopEngine {
     this.attendanceId = null
     if (!id) return
     try {
-      await axios.post(`${this.apiUrl}/attendance/clock-out`, {}, {
+      await this.http.post(`${this.apiUrl}/attendance/clock-out`, {}, {
         headers: this.headers, timeout: 8000,
       })
       this.L('Clocked out.')
@@ -543,7 +600,7 @@ export class DesktopEngine {
 
   private async fetchCurrentAttendanceId(): Promise<boolean> {
     try {
-      const { data } = await axios.get(`${this.apiUrl}/attendance/status`, {
+      const { data } = await this.http.get(`${this.apiUrl}/attendance/status`, {
         headers: this.headers, timeout: 8000,
       })
       if (data?.is_clocked_in && data?.attendance_id) {
@@ -587,7 +644,7 @@ export class DesktopEngine {
     }
 
     try {
-      const { data: { url, fields } } = await axios.get(
+      const { data: { url, fields } } = await this.http.get(
         `${this.apiUrl}/activities/screenshot-upload-url`,
         { params: { file_name: 'screenshot.jpg', content_type: 'image/jpeg' }, headers: this.headers, timeout: 8000 }
       )
@@ -661,40 +718,24 @@ export class DesktopEngine {
   private async sendOrQueuePulse(payload: any, screenshotKey: string | null) {
     const body = { ...payload, screenshot_url: screenshotKey }
     try {
-      await axios.post(`${this.apiUrl}/activities/desktop-pulse`, body, {
+      await this.http.post(`${this.apiUrl}/activities/desktop-pulse`, body, {
         headers: this.headers, timeout: 10_000,
       })
       this.L('Pulse sent.')
       await this.syncOfflineQueue() // await to prevent concurrent sync races
     } catch (e: any) {
       const status = e?.response?.status
-      if ([401, 403].includes(status)) {
-        // Try to refresh the access token before giving up
-        if (status === 401 && this.refreshToken) {
-          this.L(`Access token expired (401) — attempting refresh...`)
-          const newToken = await this.refreshAccessToken()
-          if (newToken) {
-            // Retry the pulse once with the new token
-            try {
-              await axios.post(`${this.apiUrl}/activities/desktop-pulse`, body, {
-                headers: this.headers, timeout: 10_000,
-              })
-              this.L('Pulse sent after token refresh.')
-              await this.syncOfflineQueue()
-              return
-            } catch (retryErr: any) {
-              this.L(`Pulse retry after refresh failed: ${getErrorMessage(retryErr)}`)
-            }
-          }
-        }
-        this.L(`Session expired (${status}) — force stopping.`)
-        this.forceStop()
-        this.onSessionExpired?.()
-        BrowserWindow.getAllWindows().forEach(w => w.webContents.send('session-expired'))
+      if (status === 401) {
+        // Interceptor already handled refresh + retry, or called _onSessionExpired()
+        return
+      }
+      if (status === 403) {
+        this.L('Session forbidden (403) — force stopping.')
+        this._onSessionExpired()
         return
       }
       if (status === 404) {
-        this.L(`Attendance not found (404) — force stopping.`)
+        this.L('Attendance not found (404) — force stopping.')
         this.forceStop()
         BrowserWindow.getAllWindows().forEach(w => w.webContents.send('force-stop'))
         return
@@ -707,9 +748,9 @@ export class DesktopEngine {
         if (q.length >= 500) {
           // Drop oldest 100 entries to prevent unbounded growth
           q = q.slice(100)
-          this.L("Queue capped at 500 entries — oldest 100 dropped.")
+          this.L('Queue capped at 500 entries — oldest 100 dropped.')
         }
-        // Fix 5: Stamp the date so stale cross-day pulses are discarded on replay
+        // Stamp the date so stale cross-day pulses are discarded on replay
         q.push({ ...body, _queued_date: this.trackingDate })
         await fs.writeFile(this.queueFilePath, JSON.stringify(q))
       } catch (qe) { log.error('Queue write failed:', getErrorMessage(qe)) }
@@ -739,7 +780,7 @@ export class DesktopEngine {
           continue
         }
         try {
-          await axios.post(`${this.apiUrl}/activities/desktop-pulse`, pulseBody, {
+          await this.http.post(`${this.apiUrl}/activities/desktop-pulse`, pulseBody, {
             headers: this.headers, timeout: 8000,
           })
         } catch (e: any) {

@@ -42,6 +42,7 @@ mac:
     - NSDocumentsFolderUsageDescription: Application requests access to the user's Documents folder.
     - NSDownloadsFolderUsageDescription: Application requests access to the user's Downloads folder.
     - NSScreenCaptureUsageDescription: Application requests access to the device's screen for activity tracking.
+    - NSAccessibilityUsageDescription: WorkPulse Agent requires accessibility access to monitor keyboard and mouse activity for productivity tracking.
   notarize: false
 dmg:
   artifactName: ${name}-${version}.${ext}
