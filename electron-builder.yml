@@ -35,7 +35,7 @@ nsis:
   installerHeaderIcon: build/icon.ico
 mac:
   entitlementsInherit: build/entitlements.mac.plist
-  # identity: "Apple Development: Your Name (ID)"  # TODO: Add your Apple Developer ID
+  identity: null
   extendInfo:
     - NSCameraUsageDescription: Application requests access to the device's camera.
     - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
