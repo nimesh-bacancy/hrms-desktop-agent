@@ -1,6 +1,7 @@
 import { app, BrowserWindow, Notification, dialog } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import { promises as fs } from 'fs'
+import { spawn } from 'child_process'
 import { join } from 'path'
 import log from 'electron-log'
 
@@ -115,6 +116,83 @@ async function checkForMacAsarUpdate(apiBaseUrl: string, forced = false): Promis
   }
 }
 
+// ─── Windows asar-only updater ───────────────────────────────────────────────
+// Mirrors the macOS path: downloads app.asar into userData, then applies it via
+// a detached batch script after the app exits. No .exe download → no Defender
+// quarantine, no code-signing certificate required.
+
+async function checkForWindowsAsarUpdate(apiBaseUrl: string): Promise<void> {
+  if (isDownloading) return
+  try {
+    log.info('[WinUpdater] Checking for update...')
+    const data = await fetchLatest(apiBaseUrl)
+    if (!data) return
+
+    const nonce: string | null = data.force_check_nonce ?? null
+    const nonceChanged = nonce && nonce !== lastForceNonce
+    if (nonceChanged) {
+      lastForceNonce = nonce
+      log.info('[WinUpdater] Force-check triggered by admin.')
+    }
+
+    const windows = data.windows as { version: string; asar_url?: string | null } | undefined
+    if (!windows?.version) {
+      log.warn('[WinUpdater] No windows version in /latest response')
+      return
+    }
+
+    const current = app.getVersion()
+    log.info(`[WinUpdater] Running v${current}, latest=${windows.version}`)
+    if (!semverGt(windows.version, current)) {
+      log.info(`[WinUpdater] Already up to date (v${current}).`)
+      return
+    }
+
+    if (!windows.asar_url) {
+      log.info('[WinUpdater] Newer version exists but no asar_url — skipping.')
+      return
+    }
+
+    if (isDownloading) return
+    if (downloadedVersion === windows.version) {
+      log.info(`[WinUpdater] v${windows.version} already downloaded — waiting for restart.`)
+      return
+    }
+
+    isDownloading = true
+    log.info(`[WinUpdater] Update available: v${windows.version}. Downloading asar...`)
+    BrowserWindow.getAllWindows().forEach(w =>
+      w.webContents.send('update-available', windows.version)
+    )
+
+    await downloadToFile(windows.asar_url, PENDING_ASAR())
+
+    isDownloading = false
+    downloadedVersion = windows.version
+    log.info(`[WinUpdater] v${windows.version} asar ready in userData.`)
+    BrowserWindow.getAllWindows().forEach(w =>
+      w.webContents.send('update-downloaded', windows.version)
+    )
+
+    if (Notification.isSupported()) {
+      const n = new Notification({
+        title: 'WorkPulse HR Update Ready',
+        body: `v${windows.version} is downloaded. Restart the app to install it.`,
+      })
+      n.on('click', () => {
+        BrowserWindow.getAllWindows().forEach(w => { w.show(); w.focus() })
+      })
+      n.show()
+    }
+  } catch (e: any) {
+    isDownloading = false
+    log.error('[WinUpdater] Error:', e.message)
+    BrowserWindow.getAllWindows().forEach(w =>
+      w.webContents.send('update-error', e.message)
+    )
+  }
+}
+
 // Windows/Linux: poll /latest every minute to catch new versions and admin force-checks
 async function pollForUpdates(apiBaseUrl: string): Promise<void> {
   if (isDownloading) return
@@ -137,12 +215,23 @@ async function pollForUpdates(apiBaseUrl: string): Promise<void> {
     // Normal version comparison against /latest
     const osKey = process.platform === 'win32' ? 'windows' : 'linux'
     const latest: string | undefined = data[osKey]?.version
-    if (latest && semverGt(latest, app.getVersion()) && latest !== downloadedVersion) {
-      log.info(`[Updater] Newer v${latest} found. Triggering download...`)
-      isDownloading = true
-      autoUpdater.checkForUpdates()
-        .catch(e => { log.error('[Updater] checkForUpdates failed:', e.message); isDownloading = false })
+    log.info(`[Updater] Running v${app.getVersion()}, latest=${latest ?? 'unknown'}, platform=${osKey}`)
+    if (!latest) {
+      log.warn('[Updater] No version info for this platform in /latest response')
+      return
     }
+    if (!semverGt(latest, app.getVersion())) {
+      log.info(`[Updater] Already up to date (v${app.getVersion()}).`)
+      return
+    }
+    if (latest === downloadedVersion) {
+      log.info(`[Updater] v${latest} already downloaded — waiting for restart.`)
+      return
+    }
+    log.info(`[Updater] Newer v${latest} found. Triggering download...`)
+    isDownloading = true
+    autoUpdater.checkForUpdates()
+      .catch(e => { log.error('[Updater] checkForUpdates failed:', e.message); isDownloading = false })
   } catch (e: any) {
     log.error('[Updater] pollForUpdates error:', e.message)
   }
@@ -155,9 +244,14 @@ export function initializeUpdater() {
     return
   }
 
-  // macOS uses asar-only updates to preserve accessibility permission
   if (process.platform === 'darwin') {
     log.info('[Updater] macOS: using asar-only update path.')
+    return
+  }
+
+  // Windows uses asar-only updates — no code signing required, no Defender issues
+  if (process.platform === 'win32') {
+    log.info('[Updater] Windows: using asar-only update path.')
     return
   }
 
@@ -166,6 +260,7 @@ export function initializeUpdater() {
     return
   }
 
+  // Linux AppImage only — uses electron-updater
   autoUpdater.on('checking-for-update', () => {
     log.info('[Updater] Checking for update...')
   })
@@ -211,6 +306,10 @@ export function initializeUpdater() {
   autoUpdater.on('error', (err) => {
     isDownloading = false
     log.error('[Updater] Error:', err.message)
+    // Notify renderer so the error is visible in dev tools console
+    BrowserWindow.getAllWindows().forEach(w =>
+      w.webContents.send('update-error', err.message)
+    )
   })
 }
 
@@ -224,14 +323,22 @@ export function setFeedUrl(apiBaseUrl: string) {
   if (process.platform === 'darwin') {
     if (feedConfigured) return
     feedConfigured = true
-    // First check after 10s, then every 1 minute
     setTimeout(() => checkForMacAsarUpdate(apiBaseUrl), 10_000)
     setInterval(() => checkForMacAsarUpdate(apiBaseUrl), 60_000)
     return
   }
 
+  if (process.platform === 'win32') {
+    if (feedConfigured) return
+    feedConfigured = true
+    setTimeout(() => checkForWindowsAsarUpdate(apiBaseUrl), 10_000)
+    setInterval(() => checkForWindowsAsarUpdate(apiBaseUrl), 60_000)
+    return
+  }
+
   if (process.platform === 'linux' && !process.env.APPIMAGE) return
 
+  // Linux AppImage: electron-updater
   try {
     autoUpdater.setFeedURL({
       provider: 'generic',
@@ -240,7 +347,6 @@ export function setFeedUrl(apiBaseUrl: string) {
 
     if (!feedConfigured) {
       feedConfigured = true
-      // First check after 10s, then poll every 1 minute
       setTimeout(() => pollForUpdates(apiBaseUrl), 10_000)
       setInterval(() => pollForUpdates(apiBaseUrl), 60_000)
     }
@@ -251,6 +357,35 @@ export function setFeedUrl(apiBaseUrl: string) {
 
 /** Called from IPC when user clicks "Restart to Update" in the renderer. */
 export function installUpdate() {
+  // Windows: write a detached batch script that swaps the asar after we exit
+  if (process.platform === 'win32') {
+    const pending = PENDING_ASAR()
+    const target = join(process.resourcesPath, 'app.asar')
+    const execPath = process.execPath
+    const tmpScript = join(app.getPath('temp'), 'workpulse-update.bat')
+
+    // Batch waits 2s for the process to fully exit before copying
+    const bat = [
+      '@echo off',
+      'timeout /t 2 /nobreak > nul',
+      `copy /y "${pending}" "${target}"`,
+      `if exist "${pending}" del "${pending}"`,
+      `start "" "${execPath}"`,
+      'del "%~f0"',
+    ].join('\r\n')
+
+    fs.writeFile(tmpScript, bat, 'utf8')
+      .then(() => {
+        spawn('cmd.exe', ['/c', tmpScript], { detached: true, stdio: 'ignore' }).unref()
+        app.exit(0)
+      })
+      .catch((err: any) => {
+        log.error('[WinUpdater] Failed to write update script:', err.message)
+        dialog.showErrorBox('Update Failed', `Could not apply the update: ${err.message}`)
+      })
+    return
+  }
+
   if (process.platform === 'darwin') {
     const pending = PENDING_ASAR()
     const target = join(process.resourcesPath, 'app.asar')

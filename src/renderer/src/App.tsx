@@ -149,13 +149,20 @@ const Dashboard = ({ onLogout, apiUrl, token, tenantId }: { onLogout: () => void
     const onAvailable = (_: any, version: string) => { setUpdateAvailable(version); setUpdateProgress(0) }
     const onProgress  = (_: any, pct: number)     => setUpdateProgress(pct)
     const onReady     = (_: any, version: string) => { setUpdateReady(version); setUpdateProgress(null) }
+    const onError     = (_: any, msg: string)     => {
+      console.error('[AutoUpdate] Error:', msg)
+      setUpdateAvailable(null)
+      setUpdateProgress(null)
+    }
     window.electron?.ipcRenderer?.on('update-available',        onAvailable)
     window.electron?.ipcRenderer?.on('update-download-progress', onProgress)
     window.electron?.ipcRenderer?.on('update-downloaded',       onReady)
+    window.electron?.ipcRenderer?.on('update-error',            onError)
     return () => {
       window.electron?.ipcRenderer?.removeListener('update-available',         onAvailable)
       window.electron?.ipcRenderer?.removeListener('update-download-progress', onProgress)
       window.electron?.ipcRenderer?.removeListener('update-downloaded',        onReady)
+      window.electron?.ipcRenderer?.removeListener('update-error',             onError)
     }
   }, [])
 
