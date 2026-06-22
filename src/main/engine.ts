@@ -544,13 +544,19 @@ export class DesktopEngine {
       let windowTitle: string | null = null
       let appName: string | null = null
       if (!this.isOnBreak && !this.isLocked && !process.env.WAYLAND_DISPLAY) {
-        try {
-          const { activeWindow } = await import('get-windows')
-          const w = await activeWindow()
-          windowTitle = w?.title || null
-          appName = w?.owner?.name || null
-        } catch {
-          // Native module unavailable — continue without window info
+        // On macOS, get-windows uses CGWindowListCopyWindowInfo which is a Screen Recording API.
+        // Only call it when permission is already granted — avoids a permission popup every pulse.
+        const canReadWindows = process.platform !== 'darwin' ||
+          systemPreferences.getMediaAccessStatus('screen') === 'granted'
+        if (canReadWindows) {
+          try {
+            const { activeWindow } = await import('get-windows')
+            const w = await activeWindow()
+            windowTitle = w?.title || null
+            appName = w?.owner?.name || null
+          } catch {
+            // Native module unavailable — continue without window info
+          }
         }
       }
 
