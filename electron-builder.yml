@@ -36,6 +36,10 @@ nsis:
 mac:
   entitlementsInherit: build/entitlements.mac.plist
   identity: null
+  target:
+    - target: dmg
+      arch:
+        - x64
   extendInfo:
     - NSCameraUsageDescription: Application requests access to the device's camera.
     - NSMicrophoneUsageDescription: Application requests access to the device's microphone.
