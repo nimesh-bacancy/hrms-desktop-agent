@@ -21,6 +21,9 @@ win:
         - x64
   # certificateFile: "path/to/your/certificate.pfx"
   # certificatePassword: "YOUR_PASSWORD"
+  publish:
+    provider: generic
+    url: https://api.projectsoftware.com/api/v1/system/agent-release
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: false
@@ -57,8 +60,8 @@ linux:
     - deb
   maintainer: electronjs.org
   category: Utility
+  publish:
+    provider: generic
+    url: https://api.projectsoftware.com/api/v1/system/agent-release
 appImage:
   artifactName: ${name}-${version}.${ext}
-publish:
-  provider: generic
-  url: https://api.projectsoftware.com/api/v1/system/agent-release
