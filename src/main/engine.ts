@@ -22,11 +22,13 @@ const getErrorMessage = (error: unknown): string =>
 interface AgentConfig {
   screenshot_enabled: boolean
   screenshot_interval_minutes: number // 1–60
+  is_night_shift: boolean             // shift crosses midnight → skip midnight rollover
 }
 
 const DEFAULT_CONFIG: AgentConfig = {
   screenshot_enabled: true,
   screenshot_interval_minutes: 10,
+  is_night_shift: false,
 }
 
 export class DesktopEngine {
@@ -37,6 +39,7 @@ export class DesktopEngine {
   private isOnBreak = false
   private trackingStartTime: string | null = null
   private trackingDate: string | null = null
+  private configLoaded = false   // true once agent-config (incl. is_night_shift) has been fetched at least once
 
   // ── Concurrency guards ───────────────────────────────────────────────────────
   private isPulseRunning = false
@@ -312,7 +315,12 @@ export class DesktopEngine {
       this.agentConfig = {
         screenshot_enabled: newEnabled,
         screenshot_interval_minutes: newInterval,
+        is_night_shift: data.is_night_shift ?? false,
       }
+      // We now have a real is_night_shift value from the server. Until this is true,
+      // the midnight rollover must NOT fire (otherwise a night shift that starts before
+      // config loads, or when the fetch errors, would be wrongly split at 00:00).
+      this.configLoaded = true
 
       // If interval changed, reset lastScreenshotAt so the new interval is measured from now.
       // This ensures changes take effect on the very next pulse cycle rather than from the
@@ -527,8 +535,12 @@ export class DesktopEngine {
       // Snapshot before any async — forceStop() may null this.attendanceId during awaits
       const aid = this.attendanceId
 
-      // Day-boundary rollover
-      if (this.isTracking && this.trackingDate) {
+      // Day-boundary rollover — skipped for night shifts (which legitimately cross
+      // midnight); splitting there would break the shift into two records and inflate
+      // gross hours. The night session stays one record until the shift ends.
+      // Only roll over once we KNOW the shift type (configLoaded) and it's not a night
+      // shift. If config hasn't loaded yet, defer — never split on a stale default.
+      if (this.isTracking && this.trackingDate && this.configLoaded && !this.agentConfig.is_night_shift) {
         const today = this.currentDateInTz()
         if (today !== this.trackingDate) {
           this.L(`Day boundary: ${this.trackingDate} → ${today}`)
@@ -691,9 +703,19 @@ export class DesktopEngine {
       }
       await this.triggerClockOut()
 
-      const ok = await this.triggerClockIn()
+      // Retry the new-day clock-in a few times — a single transient blip at 00:00
+      // must not silently end the whole day's tracking (the old session is already
+      // clocked out at this point, so we can't just leave it).
+      let ok = false
+      for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
+        ok = await this.triggerClockIn()
+        if (!ok && attempt < 3) {
+          this.L(`Rollover: clock-in attempt ${attempt} failed, retrying...`)
+          await new Promise(r => setTimeout(r, 3000))
+        }
+      }
       if (!ok) {
-        this.L('Rollover: clock-in failed. Stopping.')
+        this.L('Rollover: clock-in failed after retries. Stopping.')
         this.isTracking = false
         if (this.pulseInterval) { clearInterval(this.pulseInterval); this.pulseInterval = null }
         BrowserWindow.getAllWindows().forEach(w => w.webContents.send('force-stop'))
